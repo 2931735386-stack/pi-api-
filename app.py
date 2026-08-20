@@ -634,8 +634,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.model_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         self.model_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
         self.model_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
-        self.model_table.horizontalHeader().setMinimumSectionSize(80)
-        self.model_table.setColumnWidth(3, 110)  # 输入列：固定宽度以容纳 "text,image"
+        self.model_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Interactive)  # 输入列：允许手动调整
+        self.model_table.setColumnWidth(3, 120)  # 输入列宽度：容纳 "text,image"
         self.model_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
         self.model_table.verticalHeader().setVisible(False)
         self.model_table.setMinimumHeight(140)
