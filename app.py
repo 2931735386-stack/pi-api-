@@ -52,13 +52,21 @@ THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 # =============================================================================
 
 THEMES = {
-    # ===== Codex 风格（OpenAI CLI）：黑灰底 + 暖橙强调，极简终端感 =====
-    "codex": {
+    # ===== Terminal 风格：黑灰底 + 暖橙强调，极简终端感 =====
+    "terminal": {
         "bg": "#0d0d0d", "bg_alt": "#080808", "panel": "#1a1a1a", "border": "#2a2a2a",
         "text": "#e8e8e8", "text_dim": "#7a7a7a",
         "accent": "#ff8c42", "accent_2": "#d4a373", "accent_hover": "#ffa05c",
         "green": "#7cb342", "red": "#ef5350", "yellow": "#ffca28", "blue": "#5c9eff",
         "btn_text": "#0d0d0d",
+    },
+    # ===== Codex 风格（OpenAI CLI）：白色底 + 绿色强调，简洁明亮 =====
+    "codex": {
+        "bg": "#ffffff", "bg_alt": "#f5f5f5", "panel": "#f0f0f0", "border": "#e0e0e0",
+        "text": "#1a1a1a", "text_dim": "#666666",
+        "accent": "#10a37f", "accent_2": "#0d8c6f", "accent_hover": "#0e9170",
+        "green": "#10a37f", "red": "#ef4444", "yellow": "#f59e0b", "blue": "#3b82f6",
+        "btn_text": "#ffffff",
     },
     # ===== Claude Code 风格：暖橙赭 + 米色终端，温润纸质调 =====
     "claude": {
@@ -103,7 +111,7 @@ THEMES = {
 }
 
 # 默认色（向后兼容）
-COLORS = THEMES["codex"]
+COLORS = THEMES["terminal"]
 
 # Windows 常用中文字体（按优先级）
 FONT_CANDIDATES = [
@@ -115,7 +123,7 @@ FONT_CANDIDATES = [
 
 def _load_app_config():
     """读取应用自身配置（主题/字体）。"""
-    default = {"theme": "codex", "font": "", "font_size": 13}
+    default = {"theme": "terminal", "font": "", "font_size": 13}
     if not APP_CONFIG_PATH.exists():
         return default
     try:
@@ -195,23 +203,6 @@ def build_thinking_map(max_level: str) -> dict:
     # off 永远是 None（关闭思考）
     m["off"] = None
     return m
-
-# 深色主题配色（现代靛蓝+青绿风格，清新不落俗套）
-COLORS = {
-    "bg": "#0f1117",        # 主背景，接近黑但带蓝调
-    "bg_alt": "#0a0c12",     # 侧边栏背景
-    "panel": "#1a1d27",      # 卡片/输入框背景
-    "border": "#2a2e3a",     # 边框
-    "text": "#e6e8ef",       # 主文字
-    "text_dim": "#8b90a0",   # 次要文字
-    "accent": "#2dd4bf",     # 主色：青绿 teal
-    "accent_2": "#6366f1",   # 辅色：靛蓝 indigo
-    "green": "#34d399",      # 成功
-    "red": "#f87171",        # 危险
-    "yellow": "#fbbf24",     # 警告
-    "blue": "#38bdf8",       # 信息蓝
-    "accent_hover": "#5eead4",  # 主色悬停
-}
 
 
 def validate_baseurl(url: str) -> bool:
@@ -525,11 +516,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 应用配置：主题 + 字体
         self.app_config = _load_app_config()
-        self.theme_name = self.app_config.get("theme", "codex")
+        self.theme_name = self.app_config.get("theme", "terminal")
         self.font_family = self.app_config.get("font", "")
         self.font_size = int(self.app_config.get("font_size", 13))
         global COLORS
-        COLORS = THEMES.get(self.theme_name, THEMES["codex"])
+        COLORS = THEMES.get(self.theme_name, THEMES["terminal"])
 
         self._build_menu()  # 菜单栏（必须在 _build_ui 前）
         self._build_ui()
@@ -723,12 +714,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # 主题子菜单
         menu_theme = menu_view.addMenu("主题")
         theme_names = {
-            "codex": "Codex（黑灰+暖橙）",
+            "terminal": "Terminal（黑灰+暖橙）",
+            "codex": "Codex（白色+绿调）",
             "claude": "Claude Code（橙赑+米色）",
             "deepseek": "DeepSeek（深蓝+青）",
             "teal": "青绿+錡蓝",
             "night": "GitHub Night（紫+蓝）",
-            "light": "浅色",
+            "light": "浅色（灰白）",
         }
         theme_group = QtWidgets.QActionGroup(self)
         theme_group.setExclusive(True)
@@ -775,7 +767,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.app_config["theme"] = name
         _save_app_config(self.app_config)
         global COLORS
-        COLORS = THEMES.get(name, THEMES["codex"])
+        COLORS = THEMES.get(name, THEMES["terminal"])
         self._apply_style()
         self.status.setText(f"已切换主题：{name}")
 
@@ -805,7 +797,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.instance().setFont(font)
 
     def _apply_style(self):
-        c = THEMES.get(self.theme_name, THEMES["codex"])
+        c = THEMES.get(self.theme_name, THEMES["terminal"])
         bt = c["btn_text"]
         accent2_hover = c["accent_2"]
         # 计算半透明色用于微妙效果
