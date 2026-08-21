@@ -347,9 +347,146 @@ class ConfigStore:
 # 连通性测试（线程）
 # =============================================================================
 
+# =============================================================================
+# 已知模型上下文对照表（用于「探测能力」时匹配主流模型的 contextWindow）
+# 键为模型 id 的小写子串（尽量精确），值为上下文 token 数。
+# 注：上下文无法通过通用 API 直接探测，只能查表/查文档；这里维护一份常见模型表。
+# =============================================================================
+
+KNOWN_CONTEXT = {
+    # OpenAI GPT 系列
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4.1": 1047576,
+    "gpt-4.1-mini": 1047576,
+    "gpt-4.1-nano": 1047576,
+    "o1": 200000,
+    "o3": 200000,
+    "o4-mini": 200000,
+    "gpt-5": 272000,
+    "gpt-5.6": 1050000,
+    # Claude 系列
+    "claude-3-opus": 200000,
+    "claude-3.5": 200000,
+    "claude-3.7": 200000,
+    "claude-4": 200000,
+    "claude-sonnet": 200000,
+    "claude-haiku": 200000,
+    "claude-opus": 200000,
+    # Gemini 系列
+    "gemini-1.5": 2000000,
+    "gemini-2.0": 2000000,
+    "gemini-2.5": 2000000,
+    "gemini-3": 2000000,
+    # DeepSeek 系列
+    "deepseek-v3": 64000,
+    "deepseek-r1": 64000,
+    "deepseek-v4": 1048576,
+    "deepseek-chat": 64000,
+    "deepseek-reasoner": 64000,
+    # Kimi / Moonshot
+    "kimi-k2": 262144,
+    "kimi-k3": 217000,
+    "moonshot": 128000,
+    # GLM / 智谱
+    "glm-4": 128000,
+    "glm-4.5": 128000,
+    "glm-4.6": 200000,
+    "glm-5": 128000,
+    # Qwen 通义千问
+    "qwen2.5": 128000,
+    "qwen-max": 128000,
+    "qwen3": 128000,
+    "qwen-long": 10000000,
+    # Grok
+    "grok-2": 128000,
+    "grok-3": 128000,
+    "grok-4": 200000,
+    # 其他
+    "llama-3.1": 128000,
+    "llama-3.3": 128000,
+    "llama-4": 200000,
+    "mistral-large": 128000,
+    "gpt-oss": 128000,
+}
+
+
+def lookup_context_window(model_id: str):
+    """根据模型 id 在已知对照表中查找上下文窗口，返回 int 或 None。"""
+    if not model_id:
+        return None
+    low = model_id.lower()
+    # 先精确/较长匹配，再短匹配（避免误命中）
+    for key in sorted(KNOWN_CONTEXT.keys(), key=len, reverse=True):
+        if key in low:
+            return KNOWN_CONTEXT[key]
+    return None
+
+
+def probe_model_capability(base_url, api_key, model_id, timeout=8.0):
+    """主动探测单个模型是否支持图片输入。
+    发一个带 1x1 透明 PNG 的 minimal chat 请求，
+    若返回正常或未报“不支持图片/image”类错误，则认为支持图片。
+    返回 (ok, supports_image, msg)。
+    """
+    url = base_url.rstrip("/") + "/chat/completions"
+    # 1x1 透明 PNG 的 base64
+    png_b64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "YAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+    )
+    payload = {
+        "model": model_id,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "回复 ok"},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{png_b64}"}},
+                ],
+            }
+        ],
+        "max_tokens": 1,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "pi-api-switcher/1.0")
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            latency = (time.time() - t0) * 1000
+            resp.read()
+            return True, True, f"{resp.status} 支持图片（{int(latency)}ms）"
+    except urllib.error.HTTPError as e:
+        latency = (time.time() - t0) * 1000
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "ignore")
+        except Exception:
+            pass
+        low = body.lower()
+        # 判定是否明确“不支持图片/视觉”
+        unsupported_kw = ["image", "vision", "图片", "图像", "not support", "unsupported",
+                          "does not support", "invalid", "multimodal"]
+        if e.code in (400, 422) and any(k in low for k in unsupported_kw):
+            return True, False, f"{e.code} 不支持图片（{int(latency)}ms）"
+        return True, False, f"{e.code} 不支持图片（{int(latency)}ms）"
+    except urllib.error.URLError as e:
+        latency = (time.time() - t0) * 1000
+        return False, False, f"连接失败: {e.reason}"
+    except Exception as e:
+        latency = (time.time() - t0) * 1000
+        return False, False, f"错误: {e}"
+
+
 def test_endpoint(base_url, api_key, timeout=5.0):
     """对 OpenAI 兼容端点发 GET /models 请求。
-    返回 (ok, latency_ms, msg, model_ids: list[str])。
+    返回 (ok, latency_ms, msg, model_infos: list[dict])。
+    每个 model_info 尽量携带 {id, contextWindow, input, reasoning} 等能力信息，
+    端点未返回则字段缺失。
     """
     url = base_url.rstrip("/") + "/models"
     req = urllib.request.Request(url)
@@ -361,16 +498,56 @@ def test_endpoint(base_url, api_key, timeout=5.0):
             latency = (time.time() - t0) * 1000
             body = resp.read().decode("utf-8", "ignore")
             # 尝试解析模型列表
-            model_ids = []
+            model_infos = []
             try:
                 data = json.loads(body)
                 for m in data.get("data", []):
-                    mid = m.get("id", "") if isinstance(m, dict) else str(m)
-                    if mid:
-                        model_ids.append(mid)
+                    if isinstance(m, str):
+                        model_infos.append({"id": m})
+                        continue
+                    if not isinstance(m, dict):
+                        continue
+                    mid = m.get("id", "")
+                    if not mid:
+                        continue
+                    info = {"id": mid}
+                    # 能力/上下文字段（不同端点字段名不同，尽量兼容）
+                    ctx = None
+                    for key in ("contextWindow", "context_window", "contextLength",
+                                "context_length", "maxContextTokens", "max_context_tokens",
+                                "contextWindowTokens", "inputTokens", "context"):
+                        if key in m and m[key] is not None:
+                            ctx = m[key]
+                            break
+                    if ctx is not None:
+                        try:
+                            info["contextWindow"] = int(ctx)
+                        except (TypeError, ValueError):
+                            pass
+                    # 输入能力
+                    inp = m.get("input") or m.get("inputTypes") or m.get("input_types")
+                    if inp is None:
+                        # 有些端点用 capabilities/modalities
+                        caps = m.get("capabilities") or {}
+                        if isinstance(caps, dict):
+                            inp = caps.get("input") or caps.get("modalities")
+                    if inp is not None:
+                        if isinstance(inp, str):
+                            inp = [inp]
+                        if isinstance(inp, list):
+                            info["input"] = [str(x) for x in inp]
+                    # 推理能力
+                    reas = m.get("reasoning")
+                    if reas is None:
+                        caps = m.get("capabilities") or {}
+                        if isinstance(caps, dict):
+                            reas = caps.get("reasoning")
+                    if reas is not None:
+                        info["reasoning"] = bool(reas)
+                    model_infos.append(info)
             except Exception:
                 pass
-            return True, int(latency), f"{resp.status} OK", model_ids
+            return True, int(latency), f"{resp.status} OK", model_infos
     except urllib.error.HTTPError as e:
         latency = (time.time() - t0) * 1000
         # 401/403 说明端点通了但鉴权有问题；404 说明路径不对但服务在
@@ -627,18 +804,40 @@ class MainWindow(QtWidgets.QMainWindow):
         models_label.setObjectName("sectionLabel")
         rv.addWidget(models_label)
 
-        self.model_table = QtWidgets.QTableWidget(0, 5)
-        self.model_table.setHorizontalHeaderLabels(["模型 ID", "显示名", "推理", "输入", "思考上限"])
+        # 列：0 模型ID / 1 显示名 / 2 推理 / 3 输入 / 4 思考上限 / 5 上下文 / 6 最大输出 / 7 视觉模型
+        self.model_table = QtWidgets.QTableWidget(0, 8)
+        self.model_table.setHorizontalHeaderLabels(
+            ["模型 ID", "显示名", "推理", "输入", "思考上限", "上下文", "最大输出", "视觉模型"]
+        )
         self.model_table.setObjectName("modelTable")
         self.model_table.horizontalHeader().setStretchLastSection(False)
         self.model_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         self.model_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
-        self.model_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
-        self.model_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Interactive)  # 输入列：允许手动调整
-        self.model_table.setColumnWidth(3, 120)  # 输入列宽度：容纳 "text,image"
-        self.model_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        self.model_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)
+        self.model_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Fixed)  # 输入列：固定宽度
+        self.model_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.Fixed)
+        self.model_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.Fixed)
+        self.model_table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.Fixed)
+        self.model_table.horizontalHeader().setSectionResizeMode(7, QtWidgets.QHeaderView.Fixed)
+        # 固定列宽（列0/1 会自动伸缩填满剩余空间）
+        self.model_table.setColumnWidth(2, 48)   # 推理
+        self.model_table.setColumnWidth(3, 110)  # 输入
+        self.model_table.setColumnWidth(4, 84)   # 思考上限
+        self.model_table.setColumnWidth(5, 92)   # 上下文
+        self.model_table.setColumnWidth(6, 84)   # 最大输出
+        self.model_table.setColumnWidth(7, 150)  # 视觉模型
+        # 关键：禁用排序，避免点击表头时 cell widget（复选框/下拉框/按钮）错位
+        self.model_table.setSortingEnabled(False)
+        # 数字列双击编辑，其余列通过 widget 交互；文本列双击编辑
+        self.model_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditKeyPressed
+        )
+        self.model_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.model_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.model_table.verticalHeader().setVisible(False)
-        self.model_table.setMinimumHeight(140)
+        self.model_table.verticalHeader().setDefaultSectionSize(34)
+        self.model_table.setMinimumHeight(160)
         rv.addWidget(self.model_table)
 
         # 模型表格操作按钮
@@ -967,6 +1166,14 @@ class MainWindow(QtWidgets.QMainWindow):
             # 思考上限对比
             if get_max_thinking_level(tm) != get_max_thinking_level(sm):
                 return True
+            # 上下文窗口 / 最大输出对比
+            if tm.get("contextWindow", 128000) != sm.get("contextWindow", 128000):
+                return True
+            if tm.get("maxTokens", 16384) != sm.get("maxTokens", 16384):
+                return True
+            # 视觉插件对比
+            if tm.get("visionModel", "") != sm.get("visionModel", ""):
+                return True
         return False
 
     def _confirm_discard(self) -> bool:
@@ -1021,12 +1228,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 bool(m.get("reasoning", False)),
                 ",".join(m.get("input", ["text"])),
                 get_max_thinking_level(m),
+                m.get("contextWindow", 128000),
+                m.get("maxTokens", 16384),
+                m.get("visionModel", ""),
             )
         # 若表格为空，加一行空行便于编辑
         if self.model_table.rowCount() == 0:
-            self._add_model_row("", "", False, "text", "off")
+            self._add_model_row("", "", False, "text", "off", 128000, 16384, "")
 
-    def _add_model_row(self, mid, name, reasoning, input_types, max_thinking="off"):
+    def _add_model_row(self, mid, name, reasoning, input_types, max_thinking="off",
+                       context_window=128000, max_tokens=16384, vision_model=""):
         row = self.model_table.rowCount()
         self.model_table.insertRow(row)
 
@@ -1042,6 +1253,7 @@ class MainWindow(QtWidgets.QMainWindow):
         chk = QtWidgets.QCheckBox()
         chk.setChecked(reasoning)
         chk.setStyleSheet("margin: 0;")
+        chk.setFocusPolicy(QtCore.Qt.NoFocus)
         w = QtWidgets.QWidget()
         lay = QtWidgets.QHBoxLayout(w)
         lay.addWidget(chk, 0, QtCore.Qt.AlignCenter)
@@ -1053,7 +1265,13 @@ class MainWindow(QtWidgets.QMainWindow):
         combo = QtWidgets.QComboBox()
         combo.addItems(["text", "text,image"])
         combo.setCurrentText(input_types if input_types else "text")
+        combo.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.model_table.setCellWidget(row, 3, combo)
+        # 输入类型变化时联动更新视觉模型按钮（运行时定位行，避免删除行后错位）
+        combo.currentTextChanged.connect(
+            lambda txt, c=combo: self._on_input_changed(
+                self.model_table.indexAt(c.pos()).row(), txt)
+        )
 
         # 列4：思考上限（下拉框，点击编辑）
         think_combo = QtWidgets.QComboBox()
@@ -1062,14 +1280,231 @@ class MainWindow(QtWidgets.QMainWindow):
             think_combo.setCurrentText(max_thinking)
         # 未勾选推理时禁用
         think_combo.setEnabled(reasoning)
+        think_combo.setFocusPolicy(QtCore.Qt.StrongFocus)
         # 推理复选框联动：取消勾选时禁用思考等级并重置为 off
         chk.toggled.connect(lambda checked, c=think_combo: self._on_reasoning_toggled(checked, c))
         self.model_table.setCellWidget(row, 4, think_combo)
+
+        # 列5：上下文窗口（可编辑数字）
+        item_ctx = QtWidgets.QTableWidgetItem(str(context_window))
+        item_ctx.setData(QtCore.Qt.UserRole, context_window)
+        item_ctx.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.model_table.setItem(row, 5, item_ctx)
+
+        # 列6：最大输出 tokens（可编辑数字）
+        item_max = QtWidgets.QTableWidgetItem(str(max_tokens))
+        item_max.setData(QtCore.Qt.UserRole, max_tokens)
+        item_max.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.model_table.setItem(row, 6, item_max)
+
+        # 列7：视觉模型（纯文本模型可挂一个视觉插件）
+        vision_btn = QtWidgets.QPushButton()
+        vision_btn.setFocusPolicy(QtCore.Qt.NoFocus)
+        vision_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._update_vision_btn(vision_btn, vision_model, input_types, name or mid)
+        vision_btn.clicked.connect(
+            lambda _=False, b=vision_btn: self._on_pick_vision_model(
+                self.model_table.indexAt(b.pos()).row())
+        )
+        # 外层容器居中，避免按钮被拉伸占满整个 cell
+        vw = QtWidgets.QWidget()
+        vlay = QtWidgets.QHBoxLayout(vw)
+        vlay.addWidget(vision_btn, 0, QtCore.Qt.AlignCenter)
+        vlay.setContentsMargins(2, 1, 2, 1)
+        vlay.setAlignment(QtCore.Qt.AlignCenter)
+        vw.setStyleSheet("background: transparent;")
+        self.model_table.setCellWidget(row, 7, vw)
 
     def _on_reasoning_toggled(self, checked, think_combo):
         think_combo.setEnabled(checked)
         if not checked:
             think_combo.setCurrentText("off")
+
+    # ---- 视觉模型（视觉插件） ----
+    def _update_vision_btn(self, btn, vision_model, input_types, model_name=""):
+        """更新视觉模型按钮文案与状态。所有模型都可点击选择视觉桥接。
+        vision_model 格式：provider:modelId（可含多个，用 | 分隔）。
+        model_name：当前模型自己的名称（用于自身支持图片时的标识）。"""
+        has_image = "image" in [x.strip() for x in (input_types or "").split(",")]
+        btn.setStyleSheet("""
+            QPushButton {
+                border: none; border-radius: 4px; padding: 2px 8px;
+                font-size: 11px; background: transparent;
+            }
+            QPushButton:hover { background: rgba(128,128,128,0.15); }
+            QPushButton:disabled { color: #888888; }
+        """)
+        if vision_model:
+            # 已挂接视觉桥接
+            short = self._short_vision_label(vision_model)
+            btn.setText(f"🎯 {short}")
+            btn.setEnabled(True)
+            btn.setToolTip(f"视觉桥接：{vision_model}\n点击更换或清除")
+            btn.setProperty("visionModel", vision_model)
+        elif has_image:
+            # 自身支持图片，但也可选择挂接其他视觉桥接
+            label = model_name or "视觉"
+            if len(label) > 14:
+                label = label[:13] + "…"
+            btn.setText(f"🖼 {label}")
+            btn.setEnabled(True)
+            btn.setToolTip(f"该模型自身支持图片（{model_name or '视觉模型'}）\n点击可选择挂接其他视觉桥接")
+            btn.setProperty("visionModel", "")
+        else:
+            btn.setText("＋ 添加")
+            btn.setEnabled(True)
+            btn.setToolTip("为纯文本模型挂接一个视觉模型")
+            btn.setProperty("visionModel", "")
+
+    def _short_vision_label(self, vision_model):
+        """把 provider:modelId 转成友好的视觉模型显示名（provider / 模型名）。
+        优先用模型在 store 里的 name，回退到 modelId。"""
+        if not vision_model:
+            return ""
+        # 取第一个（可能多个，用 | 分隔）
+        first = vision_model.split("|")[0].strip()
+        provider = ""
+        model_id = first
+        if ":" in first:
+            provider, model_id = first.split(":", 1)
+            provider = provider.strip()
+            model_id = model_id.strip()
+        # 从 store 查模型的真实 name
+        display = model_id
+        if provider:
+            p = self.store.get_provider(provider)
+            for m in p.get("models", []):
+                if m.get("id") == model_id:
+                    display = m.get("name") or model_id
+                    break
+        # 拼接 provider / name
+        label = f"{provider} / {display}" if provider else display
+        # 过长则截断
+        return label if len(label) <= 22 else label[:21] + "…"
+
+    def _vision_btn_at(self, row):
+        """获取某行视觉模型按钮（兼容 cell widget 为容器的情况）。"""
+        w = self.model_table.cellWidget(row, 7)
+        if w is None:
+            return None
+        if isinstance(w, QtWidgets.QPushButton):
+            return w
+        # 容器内查找按钮
+        return w.findChild(QtWidgets.QPushButton)
+
+    def _on_input_changed(self, row, txt):
+        """输入类型下拉变化时，更新该行视觉模型按钮状态。"""
+        if row < 0:
+            return
+        btn = self._vision_btn_at(row)
+        if btn:
+            vision = btn.property("visionModel") or ""
+            # 从表格取模型名称（列1 显示名，回退到列0 模型 ID）
+            name_item = self.model_table.item(row, 1)
+            id_item = self.model_table.item(row, 0)
+            model_name = (name_item.text().strip() if name_item else "") or \
+                         (id_item.text().strip() if id_item else "")
+            self._update_vision_btn(btn, vision, txt, model_name)
+
+    def _on_pick_vision_model(self, row):
+        """为模型选择/更换视觉桥接（所有模型都可选择）。"""
+        if row < 0:
+            return
+
+        # 收集所有可用的视觉模型（input 含 image 的模型），跨所有 provider
+        candidates = []  # (label, vision_model_str)
+        for pname in self.store.provider_names():
+            p = self.store.get_provider(pname)
+            for m in p.get("models", []):
+                inputs = m.get("input", ["text"])
+                if "image" not in inputs:
+                    continue
+                mid = m.get("id", "")
+                if not mid:
+                    continue
+                mname = m.get("name", mid)
+                label = f"{pname} / {mname} ({mid})"
+                candidates.append((label, f"{pname}:{mid}"))
+
+        if not candidates:
+            QtWidgets.QMessageBox.information(
+                self, "无可用视觉模型",
+                "当前没有配置任何支持图像输入的模型。\n\n"
+                "请先在某供应商下添加一个 input 为 text,image 的模型。"
+            )
+            return
+
+        box = QtWidgets.QDialog(self)
+        box.setWindowTitle("选择视觉模型（视觉插件）")
+        box.resize(420, 380)
+        lay = QtWidgets.QVBoxLayout(box)
+
+        tip = QtWidgets.QLabel("为主模型挂接一个视觉模型，用于处理图片输入：")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        lst = QtWidgets.QListWidget()
+        for label, _ in candidates:
+            lst.addItem(label)
+        lay.addWidget(lst)
+
+        # 清除选项
+        btn_clear = QtWidgets.QPushButton("清除视觉插件")
+        btn_clear.setObjectName("dangerBtn")
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_ok = QtWidgets.QPushButton("确定")
+        btn_ok.setObjectName("accentBtn")
+        btn_cancel = QtWidgets.QPushButton("取消")
+        btn_row.addWidget(btn_clear)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_ok)
+        lay.addLayout(btn_row)
+
+        btn_ok.clicked.connect(box.accept)
+        btn_cancel.clicked.connect(box.reject)
+        btn_clear.clicked.connect(lambda: (lst.clearSelection(), box.done(2)))
+
+        c = COLORS
+        box.setStyleSheet(f"""
+            QDialog {{ background: {c['bg']}; }}
+            QLabel {{ color: {c['text']}; font-size: 13px; }}
+            QListWidget {{ background: {c['panel']}; border: 1px solid {c['border']}; border-radius: 6px;
+                           color: {c['text']}; font-size: 13px; }}
+            QListWidget::item {{ padding: 6px 8px; }}
+            QListWidget::item:selected {{ background: {c['accent']}; color: {c['btn_text']}; }}
+            QPushButton {{ background: {c['panel']}; color: {c['text']}; border-radius: 6px;
+                           padding: 8px 14px; font-size: 13px; }}
+            QPushButton#accentBtn {{ background: {c['accent']}; color: {c['btn_text']}; font-weight: 600; }}
+            QPushButton#dangerBtn {{ background: transparent; color: {c['red']}; border: 1px solid {c['red']}; }}
+        """)
+
+        ret = box.exec_()
+        btn = self._vision_btn_at(row)
+        if not btn:
+            return
+
+        # 获取当前行的输入类型与模型名（清除后需正确恢复显示）
+        cw = self.model_table.cellWidget(row, 3)
+        input_types = cw.currentText() if (cw and isinstance(cw, QtWidgets.QComboBox)) else "text"
+        name_item = self.model_table.item(row, 1)
+        id_item = self.model_table.item(row, 0)
+        model_name = (name_item.text().strip() if name_item else "") or \
+                     (id_item.text().strip() if id_item else "")
+
+        if ret == 2:  # 清除
+            self._update_vision_btn(btn, "", input_types, model_name)
+            return
+        if ret != QtWidgets.QDialog.Accepted:
+            return
+
+        sel = lst.currentRow()
+        if sel < 0:
+            return
+        label, vision_str = candidates[sel]
+        self._update_vision_btn(btn, vision_str, input_types, model_name)
+        self.status.setText(f"已挂接视觉插件：{label}（记得点保存）")
 
     def _read_model_table(self):
         """从表格读取模型列表（忽略空 ID 的行）。"""
@@ -1102,22 +1537,49 @@ class MainWindow(QtWidgets.QMainWindow):
             if tw and isinstance(tw, QtWidgets.QComboBox):
                 max_think = tw.currentText()
 
+            # 上下文窗口（可编辑数字）
+            context_window = self._read_int_cell(row, 5, 128000)
+            max_tokens = self._read_int_cell(row, 6, 16384)
+
+            # 视觉模型
+            vision_model = ""
+            vbtn = self._vision_btn_at(row)
+            if vbtn:
+                vision_model = vbtn.property("visionModel") or ""
+
             model = {
                 "id": mid,
                 "name": name or mid,
                 "reasoning": reasoning,
                 "input": [x.strip() for x in input_types.split(",") if x.strip()],
-                "contextWindow": 128000,
-                "maxTokens": 16384,
+                "contextWindow": context_window,
+                "maxTokens": max_tokens,
             }
             # 只有推理模型才写 thinkingLevelMap
             if reasoning and max_think != "off":
                 model["thinkingLevelMap"] = build_thinking_map(max_think)
+            # 纯文本模型挂视觉插件
+            if vision_model:
+                model["visionModel"] = vision_model
             models.append(model)
         return models
 
+    def _read_int_cell(self, row, col, default):
+        """从表格单元格读取一个非负整数，失败返回默认值。"""
+        item = self.model_table.item(row, col)
+        if item is None:
+            return default
+        txt = item.text().strip()
+        if not txt:
+            return default
+        try:
+            val = int(txt)
+            return val if val > 0 else default
+        except ValueError:
+            return default
+
     def on_add_model_row(self):
-        self._add_model_row("", "", False, "text", "off")
+        self._add_model_row("", "", False, "text", "off", 128000, 16384, "")
         self.model_table.scrollToBottom()
 
     def on_del_model_row(self):
@@ -1129,7 +1591,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for r in rows:
             self.model_table.removeRow(r)
         if self.model_table.rowCount() == 0:
-            self._add_model_row("", "", False, "text", "off")
+            self._add_model_row("", "", False, "text", "off", 128000, 16384, "")
 
     def on_toggle_key_visible(self, checked):
         self.ed_apikey.setEchoMode(
@@ -1263,18 +1725,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._testing = True
 
         def run():
-            ok, latency, msg, model_ids = test_endpoint(base_url, key)
+            ok, latency, msg, model_infos = test_endpoint(base_url, key)
+            # dict 列表无法直接用 Qt 信号传递，序列化为 JSON 字符串
+            payload = json.dumps(model_infos, ensure_ascii=False)
             QtCore.QMetaObject.invokeMethod(
                 self, "_on_test_done", QtCore.Qt.QueuedConnection,
                 QtCore.Q_ARG(str, name), QtCore.Q_ARG(bool, ok),
                 QtCore.Q_ARG(int, latency), QtCore.Q_ARG(str, msg),
-                QtCore.Q_ARG("QStringList", model_ids),
+                QtCore.Q_ARG(str, payload),
             )
 
         threading.Thread(target=run, daemon=True).start()
 
-    @QtCore.pyqtSlot(str, bool, int, str, "QStringList")
-    def _on_test_done(self, name, ok, latency, msg, model_ids):
+    @QtCore.pyqtSlot(str, bool, int, str, str)
+    def _on_test_done(self, name, ok, latency, msg, payload):
         # 窗口已关闭则跳过
         if self._closed:
             return
@@ -1285,45 +1749,116 @@ class MainWindow(QtWidgets.QMainWindow):
         self._loading_timer.stop()
         self.loading_dots.setVisible(False)
         self._testing = False
+        # 反序列化模型信息
+        model_infos = []
+        try:
+            model_infos = json.loads(payload) if payload else []
+        except ValueError:
+            model_infos = []
         icon = "✓" if ok else "✗"
         if ok:
-            n = len(model_ids)
+            n = len(model_infos)
             self.status.setText(f"{icon} {name}: {latency}ms · {msg} · 拉到 {n} 个模型")
-            if model_ids:
+            if model_infos:
                 # 弹窗展示模型列表，并可一键导入到表格
-                self._show_discovered_models(name, model_ids, latency)
+                self._show_discovered_models(name, model_infos, latency)
         else:
             self.status.setText(f"{icon} {name}: {latency}ms · {msg}")
 
-    def _show_discovered_models(self, name, model_ids, latency):
-        """展示测速发现的模型，支持勾选导入到当前 provider。"""
+    def _show_discovered_models(self, name, model_infos, latency):
+        """展示测速发现的模型（含能力信息），支持勾选导入到当前 provider。
+        纯文本模型可直接在弹窗内挂接视觉插件。"""
         box = QtWidgets.QDialog(self)
         box.setWindowTitle(f"{name} · 连通性测试（{latency}ms）")
-        box.resize(420, 420)
+        box.resize(640, 480)
         lay = QtWidgets.QVBoxLayout(box)
 
-        tip = QtWidgets.QLabel(f"端点可达，发现 {len(model_ids)} 个模型。勾选要导入的模型：")
+        tip = QtWidgets.QLabel(
+            f"端点可达，发现 {len(model_infos)} 个模型。勾选要导入的模型；"
+            f"纯文本模型可在「视觉插件」列挂接视觉模型："
+        )
         tip.setWordWrap(True)
         lay.addWidget(tip)
 
-        lst = QtWidgets.QListWidget()
-        for mid in model_ids:
-            item = QtWidgets.QListWidgetItem(mid)
-            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.Unchecked)
-            lst.addItem(item)
-        lay.addWidget(lst)
+        # 用表格展示：勾选 | 模型 ID | 图片 | 上下文 | 视觉插件
+        tbl = QtWidgets.QTableWidget(0, 5)
+        tbl.setHorizontalHeaderLabels(["导入", "模型 ID", "图片", "上下文", "视觉插件"])
+        tbl.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        tbl.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        lay.addWidget(tbl)
 
+        # 收集可选的视觉模型候选（跨所有 provider，含当前正在测试的模型）
+        vision_candidates = self._collect_vision_candidates()
+
+        # 填充表格
+        for info in model_infos:
+            mid = info.get("id", "")
+            if not mid:
+                continue
+            r = tbl.rowCount()
+            tbl.insertRow(r)
+            # 勾选列
+            chk = QtWidgets.QCheckBox()
+            chk.setChecked(True)  # 默认全选
+            w = QtWidgets.QWidget()
+            wl = QtWidgets.QHBoxLayout(w)
+            wl.addWidget(chk, 0, QtCore.Qt.AlignCenter)
+            wl.setContentsMargins(0, 0, 0, 0)
+            wl.setAlignment(QtCore.Qt.AlignCenter)
+            tbl.setCellWidget(r, 0, w)
+            # 模型 ID
+            tbl.setItem(r, 1, QtWidgets.QTableWidgetItem(mid))
+            # 图片能力
+            inp = info.get("input")
+            has_image = inp is not None and "image" in [str(x) for x in inp]
+            img_txt = "🖼 支持" if has_image else ("? 未知" if inp is None else "仅文本")
+            img_item = QtWidgets.QTableWidgetItem(img_txt)
+            img_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            tbl.setItem(r, 2, img_item)
+            # 上下文：优先端点返回，其次查已知对照表，都没有则显示“未知”
+            ctx = info.get("contextWindow")
+            if not ctx:
+                ctx = lookup_context_window(mid)
+                if ctx:
+                    info["contextWindow"] = ctx  # 回填，方便导入
+            ctx_txt = str(ctx) if ctx else "未知"
+            ctx_item = QtWidgets.QTableWidgetItem(ctx_txt)
+            ctx_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            tbl.setItem(r, 3, ctx_item)
+            # 视觉插件列：仅纯文本模型开放；图片模型显示“无需”
+            if has_image:
+                vlabel = QtWidgets.QTableWidgetItem("—")
+                vlabel.setTextAlignment(QtCore.Qt.AlignCenter)
+                vlabel.setFlags(QtCore.Qt.ItemIsEnabled)
+                tbl.setItem(r, 4, vlabel)
+            else:
+                vcombo = QtWidgets.QComboBox()
+                vcombo.addItem("(不挂接)", "")
+                for label, vstr in vision_candidates:
+                    vcombo.addItem(label, vstr)
+                vcombo.setFocusPolicy(QtCore.Qt.StrongFocus)
+                tbl.setCellWidget(r, 4, vcombo)
+
+        # 按钮行
         btn_row = QtWidgets.QHBoxLayout()
         btn_all = QtWidgets.QPushButton("全选")
         btn_none = QtWidgets.QPushButton("全不选")
+        btn_probe = QtWidgets.QPushButton("🔍 探测选中能力")
         btn_import = QtWidgets.QPushButton("导入选中")
         btn_import.setObjectName("accentBtn")
-        btn_all.clicked.connect(lambda: self._check_all_models(lst, True))
-        btn_none.clicked.connect(lambda: self._check_all_models(lst, False))
+        btn_all.clicked.connect(lambda: self._set_probe_checks(tbl, True))
+        btn_none.clicked.connect(lambda: self._set_probe_checks(tbl, False))
+        btn_probe.clicked.connect(lambda: self._probe_selected_models(name, tbl, model_infos))
         btn_import.clicked.connect(box.accept)
         btn_row.addWidget(btn_all)
         btn_row.addWidget(btn_none)
+        btn_row.addWidget(btn_probe)
         btn_row.addStretch(1)
         btn_row.addWidget(btn_import)
         lay.addLayout(btn_row)
@@ -1333,34 +1868,143 @@ class MainWindow(QtWidgets.QMainWindow):
         box.setStyleSheet(f"""
             QDialog {{ background: {c['bg']}; }}
             QLabel {{ color: {c['text']}; font-size: 13px; }}
-            QListWidget {{ background: {c['panel']}; border: 1px solid {c['border']}; border-radius: 6px;
-                           color: {c['text']}; font-size: 13px; }}
-            QListWidget::item {{ padding: 6px 8px; }}
+            QTableWidget {{ background: {c['panel']}; border: 1px solid {c['border']};
+                            border-radius: 6px; color: {c['text']}; font-size: 12px; }}
+            QHeaderView::section {{ background: {c['bg_alt']}; color: {c['text_dim']};
+                                    border: none; padding: 4px 8px; font-size: 12px; }}
+            QComboBox {{ background: {c['panel']}; color: {c['text']}; border: 1px solid {c['border']};
+                         border-radius: 4px; padding: 2px 6px; font-size: 12px; }}
+            QComboBox QAbstractItemView {{ background: {c['panel']}; color: {c['text']};
+                                            border: 1px solid {c['border']}; }}
             QPushButton {{ background: {c['panel']}; color: {c['text']}; border-radius: 6px;
                            padding: 8px 14px; font-size: 13px; }}
-            QPushButton#accentBtn {{ background: {c['accent']}; color: #0f1117; font-weight: 600; }}
+            QPushButton#accentBtn {{ background: {c['accent']}; color: {c['btn_text']}; font-weight: 600; }}
         """)
 
         if box.exec_() != QtWidgets.QDialog.Accepted:
             return
 
+        # 读取勾选结果，导入
         imported = 0
         existing_ids = {m["id"] for m in self._read_model_table()}
-        for i in range(lst.count()):
-            item = lst.item(i)
-            if item.checkState() == QtCore.Qt.Checked:
-                mid = item.text()
-                if mid not in existing_ids:
-                    self._add_model_row(mid, mid, False, "text", "off")
-                    existing_ids.add(mid)
-                    imported += 1
+        for r in range(tbl.rowCount()):
+            cw = tbl.cellWidget(r, 0)
+            chk = cw.findChild(QtWidgets.QCheckBox) if cw else None
+            if not (chk and chk.isChecked()):
+                continue
+            mid = tbl.item(r, 1).text().strip() if tbl.item(r, 1) else ""
+            if not mid or mid in existing_ids:
+                continue
+            # 从 model_infos 找对应能力
+            info = {}
+            for mi in model_infos:
+                if mi.get("id") == mid:
+                    info = mi
+                    break
+            inp = info.get("input")
+            has_image = inp is not None and "image" in [str(x) for x in inp]
+            input_types = "text,image" if has_image else "text"
+            ctx = info.get("contextWindow", 128000)
+            reasoning = bool(info.get("reasoning", False))
+            max_think = get_max_thinking_level({"reasoning": reasoning}) if reasoning else "off"
+            # 读取视觉插件选择
+            vision_model = ""
+            if not has_image:
+                vw = tbl.cellWidget(r, 4)
+                if vw and isinstance(vw, QtWidgets.QComboBox):
+                    vision_model = vw.currentData() or ""
+            self._add_model_row(mid, mid, reasoning, input_types, max_think, ctx, 16384, vision_model)
+            existing_ids.add(mid)
+            imported += 1
         if imported:
-            self.status.setText(f"已导入 {imported} 个模型，记得点保存")
+            self.status.setText(f"已导入 {imported} 个模型（含自动识别能力与视觉插件），记得点保存")
 
-    def _check_all_models(self, lst, checked):
+    def _collect_vision_candidates(self):
+        """收集所有支持图像的模型作为视觉插件候选。返回 [(label, vision_str)]。"""
+        candidates = []
+        seen = set()
+        for pname in self.store.provider_names():
+            p = self.store.get_provider(pname)
+            for m in p.get("models", []):
+                inputs = m.get("input", ["text"])
+                if "image" not in inputs:
+                    continue
+                mid = m.get("id", "")
+                if not mid:
+                    continue
+                mname = m.get("name", mid)
+                label = f"{pname} / {mname} ({mid})"
+                vstr = f"{pname}:{mid}"
+                if vstr not in seen:
+                    seen.add(vstr)
+                    candidates.append((label, vstr))
+        return candidates
+
+    def _set_probe_checks(self, tbl, checked):
         state = QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked
-        for i in range(lst.count()):
-            lst.item(i).setCheckState(state)
+        for r in range(tbl.rowCount()):
+            cw = tbl.cellWidget(r, 0)
+            chk = cw.findChild(QtWidgets.QCheckBox) if cw else None
+            if chk:
+                chk.setChecked(state)
+
+    def _probe_selected_models(self, name, tbl, model_infos):
+        """对勾选的模型逐个发带图片的最小请求，探测是否支持图片。
+        在弹窗内同步探测并直接更新表格（modal 弹窗无法用异步回调更新）。"""
+        base_url = self.ed_baseurl.text().strip()
+        key = self.ed_apikey.text().strip()
+        if not base_url:
+            return
+        # 收集勾选的模型 ID
+        selected = []
+        for r in range(tbl.rowCount()):
+            cw = tbl.cellWidget(r, 0)
+            chk = cw.findChild(QtWidgets.QCheckBox) if cw else None
+            if chk and chk.isChecked():
+                mid = tbl.item(r, 1).text().strip() if tbl.item(r, 1) else ""
+                if mid:
+                    selected.append((r, mid))
+        if not selected:
+            QtWidgets.QMessageBox.information(self, "提示", "请先勾选要探测的模型")
+            return
+
+        self.status.setText(f"正在探测 {len(selected)} 个模型的能力...")
+        # 逐个探测，同步更新表格
+        for r, mid in selected:
+            img_item = tbl.item(r, 2)
+            ctx_item = tbl.item(r, 3)
+            if img_item:
+                img_item.setText("⏳ 探测中...")
+            QtWidgets.QApplication.processEvents()
+            ok, supports, msg = probe_model_capability(base_url, key, mid)
+            if img_item:
+                img_item.setText("🖼 支持" if supports else "仅文本")
+            # 上下文：先查已知对照表，再回退到端点已返回的值
+            ctx_lookup = lookup_context_window(mid)
+            ctx_from_endpoint = None
+            for mi in model_infos:
+                if mi.get("id") == mid:
+                    mi["input"] = ["text", "image"] if supports else ["text"]
+                    ctx_from_endpoint = mi.get("contextWindow")
+                    break
+            ctx_final = ctx_lookup or ctx_from_endpoint
+            if ctx_final:
+                if ctx_item:
+                    ctx_item.setText(str(ctx_final))
+                # 同步写入 model_infos
+                for mi in model_infos:
+                    if mi.get("id") == mid:
+                        mi["contextWindow"] = ctx_final
+                        break
+            else:
+                if ctx_item:
+                    ctx_item.setText("未知")
+            self.status.setText(
+                f"{mid}: {'支持图片' if supports else '不支持图片'} · "
+                f"上下文 {ctx_final if ctx_final else '未知'} ({msg})"
+            )
+            QtWidgets.QApplication.processEvents()
+        self.status.setText(f"探测完成：{len(selected)} 个模型")
 
     def current_name(self):
         item = self.list_widget.currentItem()
