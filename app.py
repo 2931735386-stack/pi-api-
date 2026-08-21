@@ -29,6 +29,7 @@ import urllib.error
 from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from dashboard_tab import ModernDashboardTab
 
 
 # =============================================================================
@@ -82,6 +83,14 @@ THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 # =============================================================================
 
 THEMES = {
+    # ===== Modern Light (拟物卡片微拟态风格) =====
+    "modern_light": {
+        "bg": "#f4f6f9", "bg_alt": "#ebf0f5", "panel": "#ffffff", "border": "#e2e8f0",
+        "text": "#0f172a", "text_dim": "#64748b",
+        "accent": "#3b82f6", "accent_2": "#8b5cf6", "accent_hover": "#2563eb",
+        "green": "#10b981", "red": "#ef4444", "yellow": "#f59e0b", "blue": "#3b82f6",
+        "btn_text": "#ffffff",
+    },
     # ===== Terminal 风格：黑灰底 + 暖橙强调，极简终端感 =====
     "terminal": {
         "bg": "#0d0d0d", "bg_alt": "#080808", "panel": "#1a1a1a", "border": "#2a2a2a",
@@ -718,8 +727,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._testing = False
         self._closed = False
         self.setWindowTitle("pi API Switcher")
-        self.resize(900, 640)
-        self.setMinimumSize(720, 480)
+        self.resize(1060, 740)
+        self.setMinimumSize(880, 580)
 
         # 应用配置：主题 + 字体
         self.app_config = _load_app_config()
@@ -733,14 +742,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._apply_font()
         self._apply_style()
+        if hasattr(self, 'dashboard_tab') and hasattr(self.dashboard_tab, '_apply_theme_to_children'):
+            self.dashboard_tab._apply_theme_to_children(COLORS)
         self.refresh_list()
 
     def _build_ui(self):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        root = QtWidgets.QHBoxLayout(central)
+        root = QtWidgets.QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        # Tab Widget 包含「📊 用量看板」与「⚙️ API 配置」
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setObjectName("mainTabs")
+        self.tabs.setDocumentMode(True)
+
+        # Tab 1: 现代仪表盘
+        self.dashboard_tab = ModernDashboardTab(self)
+        self.tabs.addTab(self.dashboard_tab, "📊 用量统计与监控")
+
+        # Tab 2: 原有 API 供应商配置页
+        config_page = QtWidgets.QWidget()
+        config_root = QtWidgets.QHBoxLayout(config_page)
+        config_root.setContentsMargins(0, 0, 0, 0)
+        config_root.setSpacing(0)
 
         # ---- 左侧：provider 列表 ----
         left = QtWidgets.QWidget()
@@ -770,7 +796,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_row.addWidget(self.btn_del)
         lv.addLayout(btn_row)
 
-        root.addWidget(left)
+        config_root.addWidget(left)
 
         # ---- 右侧：详情/编辑 ----
         right = QtWidgets.QWidget()
@@ -844,17 +870,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.model_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         self.model_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
         self.model_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)
-        self.model_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Fixed)  # 输入列：固定宽度
+        self.model_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Fixed)  # 输入列
         self.model_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.Fixed)
-        self.model_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.Fixed)
-        self.model_table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.Fixed)
-        self.model_table.horizontalHeader().setSectionResizeMode(7, QtWidgets.QHeaderView.Fixed)
-        # 固定列宽（列0/1 会自动伸缩填满剩余空间）
+        self.model_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.Fixed)  # 上下文
+        self.model_table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.Fixed)  # 最大输出
+        self.model_table.horizontalHeader().setSectionResizeMode(7, QtWidgets.QHeaderView.Fixed)  # 视觉模型
+        # 固定列宽（加宽上下文/最大输出，避免大数字如 1048576 挤压重叠）
         self.model_table.setColumnWidth(2, 48)   # 推理
         self.model_table.setColumnWidth(3, 110)  # 输入
-        self.model_table.setColumnWidth(4, 84)   # 思考上限
-        self.model_table.setColumnWidth(5, 92)   # 上下文
-        self.model_table.setColumnWidth(6, 84)   # 最大输出
+        self.model_table.setColumnWidth(4, 88)   # 思考上限
+        self.model_table.setColumnWidth(5, 120)  # 上下文 (由 92 扩至 120，轻松容纳 7-8 位数字)
+        self.model_table.setColumnWidth(6, 96)   # 最大输出 (由 84 扩至 96)
         self.model_table.setColumnWidth(7, 150)  # 视觉模型
         # 关键：禁用排序，避免点击表头时 cell widget（复选框/下拉框/按钮）错位
         self.model_table.setSortingEnabled(False)
@@ -922,7 +948,10 @@ class MainWindow(QtWidgets.QMainWindow):
         status_row.addWidget(self.loading_dots)
         rv.addLayout(status_row)
 
-        root.addWidget(right, 1)
+        config_root.addWidget(right, 1)
+
+        self.tabs.addTab(config_page, "⚙️ 供应商与模型配置")
+        root.addWidget(self.tabs)
 
     def _add_field(self, form, row, label):
         lbl = QtWidgets.QLabel(label)
@@ -944,11 +973,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # 主题子菜单
         menu_theme = menu_view.addMenu("主题")
         theme_names = {
+            "modern_light": "Modern Light (现代微拟态/卡片风格)",
             "terminal": "Terminal（黑灰+暖橙）",
             "codex": "Codex（白色+绿调）",
-            "claude": "Claude Code（橙赑+米色）",
+            "claude": "Claude Code（橙赭+米色）",
             "deepseek": "DeepSeek（深蓝+青）",
-            "teal": "青绿+錡蓝",
+            "teal": "青绿+靛蓝",
             "night": "GitHub Night（紫+蓝）",
             "light": "浅色（灰白）",
         }
@@ -999,6 +1029,8 @@ class MainWindow(QtWidgets.QMainWindow):
         global COLORS
         COLORS = THEMES.get(name, THEMES["terminal"])
         self._apply_style()
+        if hasattr(self, 'dashboard_tab') and hasattr(self.dashboard_tab, '_apply_theme_to_children'):
+            self.dashboard_tab._apply_theme_to_children(COLORS)
         self.status.setText(f"已切换主题：{name}")
 
     def _switch_font(self, family):
@@ -1078,12 +1110,55 @@ class MainWindow(QtWidgets.QMainWindow):
             #emptySubText {{ color: {c['border']}; font-size: 13px; padding-top: 4px; }}
 
             /* === 模型表格 === */
-            #modelTable {{ background: {c['panel']}; border: 1px solid {c['border']}; border-radius: 8px;
-                           gridline-color: {c['border']}; color: {c['text']}; font-size: 13px; }}
-            #modelTable::item {{ padding: 5px 8px; }}
-            #modelTable::item:selected {{ background: {c['accent']}; color: {bt}; }}
-            QHeaderView::section {{ background: {c['bg_alt']}; color: {c['text_dim']}; border: none;
-                                    padding: 7px 10px; font-size: 12px; font-weight: 600; }}
+            #modelTable {{
+                background: {c['panel']};
+                border: 1px solid {c['border']};
+                border-radius: 8px;
+                gridline-color: {c['border']};
+                color: {c['text']};
+                font-size: 13px;
+                selection-background-color: transparent;
+                selection-color: {c['text']};
+            }}
+            #modelTable::item {{
+                padding: 5px 8px;
+            }}
+            #modelTable::item:selected {{
+                background: {c['bg_alt']};
+                color: {c['text']};
+            }}
+            #modelTable QWidget {{
+                background: transparent;
+            }}
+            #modelTable QComboBox {{
+                background: {c['panel']};
+                color: {c['text']};
+                border: 1px solid {c['border']};
+                border-radius: 4px;
+                padding: 2px 6px;
+                font-size: 12px;
+            }}
+            #modelTable QComboBox:hover {{
+                border-color: {c['accent']};
+            }}
+            #modelTable QCheckBox {{
+                background: transparent;
+            }}
+            QHeaderView::section {{
+                background: {c['bg_alt']};
+                color: {c['text_dim']};
+                border: none;
+                padding: 7px 10px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+
+            /* === 进度条 === */
+            QProgressBar#modelProgressBar {{
+                background: {c['border']};
+                border-radius: 2px;
+                border: none;
+            }}
 
             /* === 输入框 === */
             QLineEdit {{ background: {c['panel']}; border: 1px solid {c['border']}; border-radius: 6px;
@@ -1131,6 +1206,135 @@ class MainWindow(QtWidgets.QMainWindow):
                           border-top: 1px solid {c['border']}; }}
             #loadingDots {{ color: {c['accent']}; font-size: 14px; font-weight: 700;
                              padding-top: 8px; min-width: 24px; }}
+
+            /* === 现代主选项卡 (Tabs) === */
+            QTabWidget#mainTabs::pane {{
+                border: none;
+                background: {c['bg']};
+            }}
+            QTabWidget#mainTabs QTabBar::tab {{
+                background: {c['bg_alt']};
+                color: {c['text_dim']};
+                padding: 10px 22px;
+                font-size: 13px;
+                font-weight: 700;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                margin-right: 4px;
+                border: 1px solid {c['border']};
+                border-bottom: none;
+            }}
+            QTabWidget#mainTabs QTabBar::tab:selected {{
+                background: {c['panel']};
+                color: {c['accent']};
+                border-top: 3px solid {c['accent']};
+            }}
+            QTabWidget#mainTabs QTabBar::tab:hover:!selected {{
+                background: {c['panel']};
+                color: {c['text']};
+            }}
+
+            /* === KPI 卡片微拟态容器与文字层次 === */
+            QFrame#kpiCard {{
+                background-color: {c['panel']};
+                border: 1px solid {c['border']};
+                border-radius: 14px;
+            }}
+            QFrame#modelCard {{
+                background-color: {c['bg_alt']};
+                border: 1px solid {c['border']};
+                border-radius: 8px;
+            }}
+            QLabel#cardTitle {{
+                font-size: 13px;
+                font-weight: 700;
+                color: {c['text_dim']};
+            }}
+            QLabel#cardBigValue {{
+                font-size: 24px;
+                font-weight: 800;
+                color: {c['text']};
+                letter-spacing: -0.5px;
+            }}
+            QLabel#cardSubInfo {{
+                font-size: 11px;
+                color: {c['text_dim']};
+            }}
+            QLabel#sectionHeaderTitle {{
+                font-size: 16px;
+                font-weight: 800;
+                color: {c['text']};
+            }}
+            QLabel#dateRangeLabel {{
+                font-size: 12px;
+                font-weight: 500;
+                color: {c['text_dim']};
+            }}
+            QLabel#rangeBadge {{
+                font-size: 11px;
+                font-weight: 600;
+                color: {c['text_dim']};
+                background: {c['bg_alt']};
+                border: 1px solid {c['border']};
+                border-radius: 6px;
+                padding: 2px 8px;
+            }}
+            QLabel#rowLabel {{
+                font-size: 12px;
+                color: {c['text_dim']};
+            }}
+            QLabel#rowValue {{
+                font-size: 16px;
+                font-weight: 800;
+                color: {c['text']};
+            }}
+            QLabel#subHint {{
+                font-size: 10px;
+                color: {c['text_dim']};
+            }}
+            QLabel#modelName {{
+                font-size: 12px;
+                font-weight: 700;
+                color: {c['text']};
+            }}
+            QLabel#modelSub {{
+                font-size: 10px;
+                color: {c['text_dim']};
+            }}
+
+            /* === Segmented Filter Buttons === */
+            QFrame#segmentedFilterBox {{
+                background: {c['bg_alt']};
+                border: 1px solid {c['border']};
+                border-radius: 8px;
+            }}
+            QPushButton#filterSegmentBtn {{
+                background: transparent;
+                color: {c['text_dim']};
+                border: none;
+                border-radius: 6px;
+                padding: 4px 12px;
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QPushButton#filterSegmentBtn:checked {{
+                background: {c['panel']};
+                color: {c['accent']};
+                border: 1px solid {c['border']};
+            }}
+            QPushButton#filterRefreshBtn {{
+                background: {c['panel']};
+                color: {c['accent']};
+                border: 1px solid {c['border']};
+                border-radius: 8px;
+                padding: 4px 12px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QPushButton#filterRefreshBtn:hover {{
+                background: {c['bg_alt']};
+                border-color: {c['accent']};
+            }}
         """)
 
     # ---- 数据刷新 ----
@@ -1315,16 +1519,16 @@ class MainWindow(QtWidgets.QMainWindow):
         chk.toggled.connect(lambda checked, c=think_combo: self._on_reasoning_toggled(checked, c))
         self.model_table.setCellWidget(row, 4, think_combo)
 
-        # 列5：上下文窗口（可编辑数字）
+        # 列5：上下文窗口（居中对齐，留出充足内边距）
         item_ctx = QtWidgets.QTableWidgetItem(str(context_window))
         item_ctx.setData(QtCore.Qt.UserRole, context_window)
-        item_ctx.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        item_ctx.setTextAlignment(QtCore.Qt.AlignCenter)
         self.model_table.setItem(row, 5, item_ctx)
 
-        # 列6：最大输出 tokens（可编辑数字）
+        # 列6：最大输出 tokens（居中对齐）
         item_max = QtWidgets.QTableWidgetItem(str(max_tokens))
         item_max.setData(QtCore.Qt.UserRole, max_tokens)
-        item_max.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        item_max.setTextAlignment(QtCore.Qt.AlignCenter)
         self.model_table.setItem(row, 6, item_max)
 
         # 列7：视觉模型（纯文本模型可挂一个视觉插件）

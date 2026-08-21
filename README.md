@@ -13,10 +13,11 @@ CC Switch 风格的 pi API/模型配置桌面管理器（PyQt5）。
 ## 功能
 
 - **切换激活模型**：把某个 provider/model 设为默认，写回 `settings.json`，pi 下次启动即用
+- **用量统计与监控看板**：全新现代微拟态卡片风格，自动分析 `~/.pi/agent/sessions/`，展示各模型 Token 占比、Prompt Cache 命中率、平滑趋势曲线、70 天 GitHub 风格活动矩阵及请求健康时间线
 - **增删改 provider**：管理 `baseUrl` / `apiKey` / 模型 ID / 显示名 / reasoning
 - **连通性测试**：对各端点发 `/models` 请求，显示延迟和状态
 - **系统托盘常驻**：右键菜单快速切换默认模型，无需开主窗口
-- **多主题支持**：Terminal / Codex / Claude Code / DeepSeek / 青绿+靛蓝 / GitHub Night / 浅色
+- **多主题支持**：Modern Light (现代微拟态) / Terminal / Codex / Claude Code / DeepSeek / 青绿+靛蓝 / GitHub Night / 浅色
 - **多模型管理**：每个 provider 可配置多个模型，支持批量导入
 - **上下文窗口配置**：可视化查看/编辑每个模型的 `contextWindow`（最大上下文）与 `maxTokens`（最大输出）
 - **视觉模型（视觉桥接）**：纯文本模型可挂接一个支持图像的模型；安装 Vision Bridge 扩展后，图片会先被该模型转写，再交给主模型
