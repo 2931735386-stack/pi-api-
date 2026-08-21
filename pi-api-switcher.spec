@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('vision-bridge.ts', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

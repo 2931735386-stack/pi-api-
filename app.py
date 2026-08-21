@@ -42,6 +42,36 @@ SETTINGS_PATH = AGENT_DIR / "settings.json"
 
 # 应用自身配置（保存主题/字体选择）
 APP_CONFIG_PATH = AGENT_DIR / "api-switcher.json"
+VISION_BRIDGE_NAME = "vision-bridge.ts"
+
+
+def install_vision_bridge() -> str:
+    """Install the bundled pi extension without overwriting user customizations.
+
+    Returns a short status string for the UI. The source is included as a PyInstaller
+    data file and falls back to the source directory during development.
+    """
+    bundled_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    source = bundled_dir / VISION_BRIDGE_NAME
+    target_dir = AGENT_DIR / "extensions"
+    target = target_dir / VISION_BRIDGE_NAME
+    if not source.exists():
+        return "视觉桥接扩展未找到"
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        source_text = source.read_text(encoding="utf-8")
+        if target.exists():
+            target_text = target.read_text(encoding="utf-8")
+            if target_text == source_text:
+                return "视觉桥接扩展已就绪"
+            if not target_text.startswith("// Managed by pi-api-switcher."):
+                return "已保留用户自定义视觉桥接扩展"
+            target.write_text(source_text, encoding="utf-8")
+            return "已更新视觉桥接扩展"
+        target.write_text(source_text, encoding="utf-8")
+        return "已安装视觉桥接扩展"
+    except OSError as exc:
+        return f"视觉桥接扩展安装失败：{exc}"
 
 # pi 思考等级（从低到高），null 表示该等级不支持
 THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
@@ -1322,8 +1352,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- 视觉模型（视觉插件） ----
     def _update_vision_btn(self, btn, vision_model, input_types, model_name=""):
-        """更新视觉模型按钮文案与状态。所有模型都可点击选择视觉桥接。
+        """更新视觉桥接按钮文案与状态。
         vision_model 格式：provider:modelId（可含多个，用 | 分隔）。
+        需配合 ~/.pi/agent/extensions/vision-bridge.ts 将图片转写为文本。
         model_name：当前模型自己的名称（用于自身支持图片时的标识）。"""
         has_image = "image" in [x.strip() for x in (input_types or "").split(",")]
         btn.setStyleSheet("""
@@ -1339,7 +1370,7 @@ class MainWindow(QtWidgets.QMainWindow):
             short = self._short_vision_label(vision_model)
             btn.setText(f"🎯 {short}")
             btn.setEnabled(True)
-            btn.setToolTip(f"视觉桥接：{vision_model}\n点击更换或清除")
+            btn.setToolTip(f"视觉桥接：{vision_model}\n由 vision-bridge.ts 转写图片后交给主模型\n点击更换或清除")
             btn.setProperty("visionModel", vision_model)
         elif has_image:
             # 自身支持图片，但也可选择挂接其他视觉桥接
@@ -1353,7 +1384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             btn.setText("＋ 添加")
             btn.setEnabled(True)
-            btn.setToolTip("为纯文本模型挂接一个视觉模型")
+            btn.setToolTip("为纯文本模型挂接视觉桥接（需要 vision-bridge.ts）")
             btn.setProperty("visionModel", "")
 
     def _short_vision_label(self, vision_model):
@@ -1439,7 +1470,7 @@ class MainWindow(QtWidgets.QMainWindow):
         box.resize(420, 380)
         lay = QtWidgets.QVBoxLayout(box)
 
-        tip = QtWidgets.QLabel("为主模型挂接一个视觉模型，用于处理图片输入：")
+        tip = QtWidgets.QLabel("为主模型挂接视觉桥接：图片将先转写为文本，再交给主模型（需要 vision-bridge.ts）：")
         tip.setWordWrap(True)
         lay.addWidget(tip)
 
@@ -2095,8 +2126,10 @@ def main():
     icon = QtGui.QIcon(str(icon_path)) if icon_path.exists() else QtGui.QIcon()
     app.setWindowIcon(icon)
 
+    bridge_status = install_vision_bridge()
     store = ConfigStore()
     window = MainWindow(store)
+    window.status.setText(bridge_status)
 
     # 系统托盘
     tray = TrayApp(icon, window, store)

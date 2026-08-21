@@ -19,7 +19,7 @@ CC Switch 风格的 pi API/模型配置桌面管理器（PyQt5）。
 - **多主题支持**：Terminal / Codex / Claude Code / DeepSeek / 青绿+靛蓝 / GitHub Night / 浅色
 - **多模型管理**：每个 provider 可配置多个模型，支持批量导入
 - **上下文窗口配置**：可视化查看/编辑每个模型的 `contextWindow`（最大上下文）与 `maxTokens`（最大输出）
-- **视觉模型（视觉插件）**：纯文本模型可挂接一个支持图像的模型作为视觉插件，处理图片输入
+- **视觉模型（视觉桥接）**：纯文本模型可挂接一个支持图像的模型；安装 Vision Bridge 扩展后，图片会先被该模型转写，再交给主模型
 
 ## 安装
 
@@ -63,8 +63,9 @@ python -m PyInstaller --noconsole --onefile --name "pi-api-switcher" --icon=icon
 ## 说明
 
 - 修改会**立即落盘**，pi 下次启动生效；部分修改需要 pi 里 `/reload`。
+- **运行时要求**：`visionModel` 是 switcher 与 `vision-bridge.ts` 扩展之间的配置约定，并非 pi 内置字段。未安装扩展时，pi 不会自动转发图片。
 - **最大上下文**：模型表格中的“上下文”列对应 pi 配置里的 `contextWindow`，可直接查看/编辑每个模型支持的最大上下文长度。
-- **视觉插件**：当某个模型的输入类型为纯文本（`input: ["text"]`）时，可在“视觉模型”列点击“＋ 添加视觉”，从所有支持图像输入的模型中选择一个作为视觉插件（存储为模型的 `visionModel` 字段）。若模型本身已支持图像（`input: ["text", "image"]`），则无需插件。
+- **视觉桥接**：当某个模型的输入类型为纯文本（`input: ["text"]`）时，可在“视觉模型”列点击“＋ 添加视觉”，从所有支持图像输入的模型中选择桥接模型（存储为模型的 `visionModel` 字段）。安装 `~/.pi/agent/extensions/vision-bridge.ts` 后，pi 收到图片会先调用桥接模型生成图像转写，随后仅将原始文本和转写交给主模型；若主模型自身已支持图片（`input: ["text", "image"]`），则直接发送图片，不经过桥接。
 - apiKey 显示为掩码，不会明文泄露（但编辑框内可查看/修改完整 key）。
 - 首次运行会在目录下自动生成 `icon.ico`。
 
