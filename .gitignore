@@ -33,3 +33,6 @@ desktop.ini
 
 # App config (user-specific)
 # api-switcher.json  # 不忽略，保留主题偏好
+# 开发期内部审查脚本（不公开发布）
+review.py
+review-kimi.md

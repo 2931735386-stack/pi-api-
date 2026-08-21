@@ -2,9 +2,13 @@
 
 CC Switch 风格的 pi API/模型配置桌面管理器（PyQt5）。
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
+[![PyQt5](https://img.shields.io/badge/GUI-PyQt5-green.svg)](https://riverbankcomputing.com/software/pyqt)
+
 管理 pi 的 `~/.pi/agent/` 三个配置文件，可视化增删改中转端点（deepseek/glm/kimi/grok 等），一键切换默认模型，支持连通性测试和系统托盘常驻。
 
-![preview](preview.png)
+![preview](icon_preview.png)
 
 ## 功能
 
@@ -21,13 +25,13 @@ CC Switch 风格的 pi API/模型配置桌面管理器（PyQt5）。
 
 ### 方式 1：直接运行 exe（推荐）
 
-从 [Releases](https://github.com/YOUR_USERNAME/pi-api-switcher/releases) 下载最新 exe，双击即用。
+从 [Releases](https://github.com/2931735386-stack/pi-api-/releases) 下载最新 exe，双击即用。
 
 ### 方式 2：从源码运行
 
 ```bash
 # 克隆仓库
-git clone https://github.com/YOUR_USERNAME/pi-api-switcher.git
+git clone https://github.com/2931735386-stack/pi-api-.git
 cd pi-api-switcher
 
 # 安装依赖
