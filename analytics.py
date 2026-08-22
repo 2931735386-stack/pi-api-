@@ -21,9 +21,101 @@ from collections import defaultdict
 
 
 # 默认基础费率估算（每 1M Tokens 美元）：输入 $1.50, 输出 $2.00, 缓存读 $0.30
-PRICE_PER_M_INPUT = 1.50
-PRICE_PER_M_OUTPUT = 2.00
-PRICE_PER_M_CACHE_READ = 0.30
+# 可被 ~/.pi/agent/api-switcher.json 中的 priceRates 配置覆盖
+DEFAULT_PRICE_PER_M_INPUT = 1.50
+DEFAULT_PRICE_PER_M_OUTPUT = 2.00
+DEFAULT_PRICE_PER_M_CACHE_READ = 0.30
+
+
+def _load_price_rates():
+    """从应用配置 api-switcher.json 读取自定义费率，缺失时回退到默认值。
+    配置示例：{"priceRates": {"input": 1.5, "output": 2.0, "cacheRead": 0.3}}"""
+    cfg_path = Path.home() / ".pi" / "agent" / "api-switcher.json"
+    rates = cfg_path.read_text(encoding="utf-8") if cfg_path.exists() else ""
+    try:
+        cfg = json.loads(rates) if rates.strip() else {}
+        pr = cfg.get("priceRates", {}) or {}
+        return (
+            float(pr.get("input", DEFAULT_PRICE_PER_M_INPUT)),
+            float(pr.get("output", DEFAULT_PRICE_PER_M_OUTPUT)),
+            float(pr.get("cacheRead", DEFAULT_PRICE_PER_M_CACHE_READ)),
+        )
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return (DEFAULT_PRICE_PER_M_INPUT, DEFAULT_PRICE_PER_M_OUTPUT, DEFAULT_PRICE_PER_M_CACHE_READ)
+
+
+def _load_all_records(sessions_dir):
+    """一次性读取并解析 sessions 目录下所有 JSONL 记录，返回规范化的 dict 列表。
+    结果按文件路径+mtime 缓存，文件未改动时直接返回缓存，避免重复磁盘 I/O。
+    """
+    jsonl_files = list(sessions_dir.glob("**/*.jsonl"))
+    # 检查缓存是否可复用：文件集合与 mtime 未变
+    current_sig = {str(f): f.stat().st_mtime for f in jsonl_files if f.exists()}
+    cache = _RAW_RECORDS_CACHE.get(str(sessions_dir))
+    if cache and cache["sig"] == current_sig:
+        return cache["records"]
+
+    records = []
+    for f in jsonl_files:
+        try:
+            with open(f, "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except Exception:
+                        continue
+                    msg = data.get("message", {})
+                    if not isinstance(msg, dict):
+                        continue
+                    u = msg.get("usage")
+                    if not isinstance(u, dict):
+                        continue
+
+                    model = msg.get("model") or msg.get("responseModel") or data.get("model") or "unknown"
+                    ts = msg.get("timestamp") or data.get("timestamp")
+                    epoch_s = 0.0
+                    if ts:
+                        if isinstance(ts, (int, float)):
+                            epoch_s = ts / 1000.0 if ts > 1e11 else float(ts)
+                        elif isinstance(ts, str):
+                            try:
+                                dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                                epoch_s = dt.timestamp()
+                            except Exception:
+                                pass
+
+                    stop_reason = msg.get("stopReason", "")
+                    is_fail = stop_reason in ["error", "abort"] or "error" in data
+                    inp = u.get("input", 0) or 0
+                    out = u.get("output", 0) or 0
+                    cr = u.get("cacheRead", 0) or 0
+                    cw = u.get("cacheWrite", 0) or 0
+                    rea = u.get("reasoning", 0) or 0
+                    tot = u.get("totalTokens", inp + out) or (inp + out)
+
+                    records.append({
+                        "model": model,
+                        "epoch_s": epoch_s,
+                        "is_fail": is_fail,
+                        "input": inp,
+                        "output": out,
+                        "cacheRead": cr,
+                        "cacheWrite": cw,
+                        "reasoning": rea,
+                        "total": tot,
+                    })
+        except Exception:
+            continue
+
+    _RAW_RECORDS_CACHE[str(sessions_dir)] = {"sig": current_sig, "records": records}
+    return records
+
+
+# 原始记录缓存：{目录路径: {"sig": {文件路径: mtime}, "records": [...]}}
+_RAW_RECORDS_CACHE = {}
 
 
 def parse_session_records(sessions_dir=None, filter_mode="year"):
@@ -38,8 +130,6 @@ def parse_session_records(sessions_dir=None, filter_mode="year"):
     if not sessions_dir.exists():
         return _empty_result()
 
-    jsonl_files = list(sessions_dir.glob("**/*.jsonl"))
-    
     now = datetime.datetime.now()
     cutoff_time = 0.0
     if filter_mode == "day":
@@ -74,95 +164,63 @@ def parse_session_records(sessions_dir=None, filter_mode="year"):
 
     timestamps = []
 
-    for f in jsonl_files:
-        try:
-            with open(f, "r", encoding="utf-8", errors="ignore") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except Exception:
-                        continue
-                        
-                    msg = data.get("message", {})
-                    if not isinstance(msg, dict):
-                        continue
-                    u = msg.get("usage")
-                    if not isinstance(u, dict):
-                        continue
-
-                    model = msg.get("model") or msg.get("responseModel") or data.get("model") or "unknown"
-                    ts = msg.get("timestamp") or data.get("timestamp")
-                    
-                    epoch_s = 0.0
-                    if ts:
-                        if isinstance(ts, (int, float)):
-                            epoch_s = ts / 1000.0 if ts > 1e11 else float(ts)
-                        elif isinstance(ts, str):
-                            try:
-                                dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                                epoch_s = dt.timestamp()
-                            except Exception:
-                                pass
-
-                    if cutoff_time > 0 and epoch_s > 0 and epoch_s < cutoff_time:
-                        continue
-
-                    if epoch_s > 0:
-                        timestamps.append(epoch_s)
-
-                    stop_reason = msg.get("stopReason", "")
-                    is_fail = stop_reason in ["error", "abort"] or "error" in data
-                    
-                    inp = u.get("input", 0) or 0
-                    out = u.get("output", 0) or 0
-                    cr = u.get("cacheRead", 0) or 0
-                    cw = u.get("cacheWrite", 0) or 0
-                    rea = u.get("reasoning", 0) or 0
-                    tot = u.get("totalTokens", inp + out) or (inp + out)
-
-                    total_calls += 1
-                    if is_fail:
-                        failed_calls += 1
-                    else:
-                        success_calls += 1
-
-                    total_tokens += tot
-                    total_input += inp
-                    total_output += out
-                    total_cache_read += cr
-                    total_cache_write += cw
-                    total_reasoning += rea
-
-                    model_map[model]["calls"] += 1
-                    model_map[model]["input"] += inp
-                    model_map[model]["output"] += out
-                    model_map[model]["cacheRead"] += cr
-                    model_map[model]["cacheWrite"] += cw
-                    model_map[model]["reasoning"] += rea
-                    model_map[model]["total"] += tot
-
-                    if epoch_s > model_map[model]["last_used"]:
-                        model_map[model]["last_used"] = epoch_s
-
-                    if epoch_s > 0:
-                        dt = datetime.datetime.fromtimestamp(epoch_s)
-                        dstr = dt.strftime("%Y-%m-%d")
-                        daily_map[dstr]["calls"] += 1
-                        daily_map[dstr]["tokens"] += tot
-                        daily_map[dstr]["input"] += inp
-                        daily_map[dstr]["output"] += out
-                        daily_map[dstr]["cacheRead"] += cr
-                        daily_map[dstr]["cacheWrite"] += cw
-                        daily_map[dstr]["reasoning"] += rea
-                        if is_fail:
-                            daily_map[dstr]["fail"] += 1
-                        else:
-                            daily_map[dstr]["success"] += 1
-        except Exception:
+    # 一次性读入所有原始记录（P-1：避免切换 filter 时全量重扫文件）
+    for rec in _load_all_records(sessions_dir):
+        epoch_s = rec["epoch_s"]
+        # 切换 filter 时只做聚合计算，不重复磁盘 I/O
+        if cutoff_time > 0 and epoch_s > 0 and epoch_s < cutoff_time:
             continue
+
+        model = rec["model"]
+        is_fail = rec["is_fail"]
+        inp = rec["input"]
+        out = rec["output"]
+        cr = rec["cacheRead"]
+        cw = rec["cacheWrite"]
+        rea = rec["reasoning"]
+        tot = rec["total"]
+
+        if epoch_s > 0:
+            timestamps.append(epoch_s)
+
+        total_calls += 1
+        if is_fail:
+            failed_calls += 1
+        else:
+            success_calls += 1
+
+        total_tokens += tot
+        total_input += inp
+        total_output += out
+        total_cache_read += cr
+        total_cache_write += cw
+        total_reasoning += rea
+
+        model_map[model]["calls"] += 1
+        model_map[model]["input"] += inp
+        model_map[model]["output"] += out
+        model_map[model]["cacheRead"] += cr
+        model_map[model]["cacheWrite"] += cw
+        model_map[model]["reasoning"] += rea
+        model_map[model]["total"] += tot
+
+        if epoch_s > model_map[model]["last_used"]:
+            model_map[model]["last_used"] = epoch_s
+
+        if epoch_s > 0:
+            dt = datetime.datetime.fromtimestamp(epoch_s)
+            dstr = dt.strftime("%Y-%m-%d")
+            daily_map[dstr]["calls"] += 1
+            daily_map[dstr]["tokens"] += tot
+            daily_map[dstr]["input"] += inp
+            daily_map[dstr]["output"] += out
+            daily_map[dstr]["cacheRead"] += cr
+            daily_map[dstr]["cacheWrite"] += cw
+            daily_map[dstr]["reasoning"] += rea
+            if is_fail:
+                daily_map[dstr]["fail"] += 1
+            else:
+                daily_map[dstr]["success"] += 1
 
     # 日期范围
     if timestamps:
@@ -226,11 +284,12 @@ def parse_session_records(sessions_dir=None, filter_mode="year"):
         daily_trend_calls.append(dinfo["calls"])
         daily_trend_cache.append(dinfo["cacheRead"])
 
-    # 成本估算
+    # 成本估算（费率可从 api-switcher.json 的 priceRates 覆盖）
+    price_in, price_out, price_cr = _load_price_rates()
     total_cost = (
-        (total_input / 1_000_000.0) * PRICE_PER_M_INPUT +
-        (total_output / 1_000_000.0) * PRICE_PER_M_OUTPUT +
-        (total_cache_read / 1_000_000.0) * PRICE_PER_M_CACHE_READ
+        (total_input / 1_000_000.0) * price_in +
+        (total_output / 1_000_000.0) * price_out +
+        (total_cache_read / 1_000_000.0) * price_cr
     )
     
     # 每日平均指标

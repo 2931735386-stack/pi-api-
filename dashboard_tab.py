@@ -10,7 +10,8 @@ Modern Analytics Dashboard Tab for pi-api-switcher
 """
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QFileSystemWatcher
+from pathlib import Path
 
 import analytics
 from dashboard_widgets import (
@@ -39,7 +40,21 @@ class ModernDashboardTab(QtWidgets.QWidget):
         self.setObjectName("dashboardTab")
         self.current_filter = "year"
         self._build_ui()
+        self._setup_auto_watcher()
         self.load_data()
+
+    def _setup_auto_watcher(self):
+        """监听 ~/.pi/agent/sessions 目录变动，会话更新时自动防抖刷新看板。"""
+        sessions_dir = Path.home() / ".pi" / "agent" / "sessions"
+        if sessions_dir.exists():
+            self._watcher = QFileSystemWatcher(self)
+            self._watcher.addPath(str(sessions_dir))
+            # 防抖定时器（500ms 内多次写入只触发一次刷新）
+            self._debounce_timer = QtCore.QTimer(self)
+            self._debounce_timer.setSingleShot(True)
+            self._debounce_timer.setInterval(600)
+            self._debounce_timer.timeout.connect(self.load_data)
+            self._watcher.directoryChanged.connect(lambda _: self._debounce_timer.start())
 
     def _build_ui(self):
         main_layout = QtWidgets.QVBoxLayout(self)
@@ -64,6 +79,7 @@ class ModernDashboardTab(QtWidgets.QWidget):
 
         # Card 1: 每日平均
         self.card_daily = DailyAvgCardWidget(self)
+        self.card_daily.setMinimumHeight(140)
         row1.addWidget(self.card_daily, 3)
 
         # Card 2: 请求总数
@@ -73,6 +89,7 @@ class ModernDashboardTab(QtWidgets.QWidget):
             accent_color="#3b82f6",
             parent=self
         )
+        self.card_requests.setMinimumHeight(140)
         row1.addWidget(self.card_requests, 4)
 
         # Card 3: Token 总数
@@ -82,6 +99,7 @@ class ModernDashboardTab(QtWidgets.QWidget):
             accent_color="#8b5cf6",
             parent=self
         )
+        self.card_tokens.setMinimumHeight(140)
         row1.addWidget(self.card_tokens, 4)
 
         content_layout.addLayout(row1)
@@ -96,6 +114,8 @@ class ModernDashboardTab(QtWidgets.QWidget):
         self.card_tpm = StandardCardWidget(title="TPM", icon_char="📈", accent_color="#f97316", parent=self)
         self.card_cache = StandardCardWidget(title="缓存率", icon_char="%", accent_color="#06b6d4", parent=self)
         self.card_cost = StandardCardWidget(title="总成本", icon_char="$", accent_color="#f59e0b", parent=self)
+        for _c in (self.card_rpm, self.card_tpm, self.card_cache, self.card_cost):
+            _c.setMinimumHeight(140)
 
         row2.addWidget(self.card_rpm, 1)
         row2.addWidget(self.card_tpm, 1)
@@ -276,6 +296,21 @@ class ModernDashboardTab(QtWidgets.QWidget):
 
     def load_data(self):
         self.btn_refresh.setEnabled(False)
+        # U-11：加载期间显示占位状态（骨架屏），避免显示旧数据或 0
+        self.card_daily.val_req.setText("—")
+        self.card_daily.val_tok.setText("—")
+        self.card_daily.val_cost.setText("—")
+        for _card in (self.card_requests, self.card_tokens, self.card_rpm,
+                      self.card_tpm, self.card_cache, self.card_cost):
+            _card.lbl_value.setText("—")
+            _card.lbl_sub.setText("加载中...")
+            _card.spark.set_data([])
+        self.lbl_date_range.setText("加载中...")
+        self.lbl_model_count.setText("—")
+        self.lbl_token_badge_val.setText("—")
+        self.lbl_token_badge_sub.setText("加载中...")
+        self.lbl_health_badge_val.setText("—")
+        self.lbl_health_badge_sub.setText("加载中...")
         self.worker = DataLoadWorker(filter_mode=self.current_filter)
         self.worker.loaded.connect(self._on_data_loaded)
         self.worker.start()
@@ -286,6 +321,7 @@ class ModernDashboardTab(QtWidgets.QWidget):
         self.heatmap_health.set_theme_colors(c)
         self.legend_tokens.set_theme_colors(c)
         self.legend_health.set_theme_colors(c)
+        self.model_list_widget.set_theme_colors(c)
 
     def _on_data_loaded(self, data):
         self.btn_refresh.setEnabled(True)
@@ -347,7 +383,7 @@ class ModernDashboardTab(QtWidgets.QWidget):
         # 7. 总成本 (Card 7)
         self.card_cost.update_data(
             value_str=f"${data.get('total_cost', 0.0):.2f}",
-            sub_info=f"Token 总数: {fmt(tot_tokens)}  请先设置价格以计算成本",
+            sub_info=f"Token 总数: {fmt(tot_tokens)}  ·  成本按 api-switcher.json 的 priceRates 估算",
             spark_data=data.get("daily_trend_tokens", [])[-14:]
         )
 

@@ -13,10 +13,11 @@ CC Switch 风格的 pi API/模型配置桌面管理器（PyQt5）。
 ## 功能
 
 - **切换激活模型**：把某个 provider/model 设为默认，写回 `settings.json`，pi 下次启动即用
-- **用量统计与监控看板**：全新现代微拟态卡片风格，自动分析 `~/.pi/agent/sessions/`，展示各模型 Token 占比、Prompt Cache 命中率、平滑趋势曲线、70 天 GitHub 风格活动矩阵及请求健康时间线
-- **增删改 provider**：管理 `baseUrl` / `apiKey` / 模型 ID / 显示名 / reasoning
-- **连通性测试**：对各端点发 `/models` 请求，显示延迟和状态
-- **系统托盘常驻**：右键菜单快速切换默认模型，无需开主窗口
+- **用量统计与监控看板**：全新现代微拟态卡片风格，自动分析 `~/.pi/agent/sessions/`，展示各模型 Token 占比、Prompt Cache 命中率、平滑趋势曲线、70 天 GitHub 风格活动矩阵及请求健康时间线，支持热力图悬停 Tooltip 详情
+- **会话实时监听**：自动监听 sessions 目录变动，终端使用 pi 产生问答后看板自动防抖刷新，无需手动点击
+- **增删改 provider 与即时搜索**：侧边栏支持按供应商名、BaseURL 及模型名称实时关键字过滤
+- **并发批量测速与状态呼吸灯**：一键并发测试全部端点连通性，侧边栏直观显示延迟及状态指示点（🟢 <600ms / 🟡 >600ms / 🔴 超时）
+- **操作反馈与 Toast 胶囊**：设为默认、保存配置、切换主题均带有顶部平滑淡入淡出的 Toast 胶囊提示
 - **多主题支持**：Modern Light (现代微拟态) / Terminal / Codex / Claude Code / DeepSeek / 青绿+靛蓝 / GitHub Night / 浅色
 - **多模型管理**：每个 provider 可配置多个模型，支持批量导入
 - **上下文窗口配置**：可视化查看/编辑每个模型的 `contextWindow`（最大上下文）与 `maxTokens`（最大输出）
@@ -60,6 +61,24 @@ python -m PyInstaller --noconsole --onefile --name "pi-api-switcher" --icon=icon
 | `~/.pi/agent/models.json` | providers 段（baseUrl / api / models / compat / contextWindow / visionModel） |
 | `~/.pi/agent/auth.json` | apiKey（provider 名 → {type, key}） |
 | `~/.pi/agent/settings.json` | defaultProvider / defaultModel / enabledModels |
+| `~/.pi/agent/api-switcher.json` | 应用自身配置（主题 / 字体 / 字号 / 价格费率） |
+
+## 成本估算配置
+
+看板上的“总成本”与“平均费用”默认按输入 $1.50 / 输出 $2.00 / 缓存读 $0.30（每 1M Tokens）估算。可在 `~/.pi/agent/api-switcher.json` 中通过 `priceRates` 字段自定义费率（单位：美元 / 1M Tokens）：
+
+```json
+{
+  "theme": "terminal",
+  "priceRates": {
+    "input": 1.50,
+    "output": 2.00,
+    "cacheRead": 0.30
+  }
+}
+```
+
+未配置时自动回退到默认费率。
 
 ## 说明
 

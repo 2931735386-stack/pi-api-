@@ -93,15 +93,20 @@ class SparklineWidget(QtWidgets.QWidget):
         painter.setPen(pen)
         painter.drawPath(path)
 
-        # Draw end dot
+        # Draw end dot（半径增大到 5px 并加白色描边，增强端点视觉存在感）
         last_pt = points[-1]
         painter.setBrush(QBrush(self.stroke_color))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(last_pt, 3.5, 3.5)
+        pen = QPen(QColor(255, 255, 255), 1.5)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawEllipse(last_pt, 5.0, 5.0)
 
 
 class DailyAvgCardWidget(QtWidgets.QFrame):
     """Card 1 (Top-Left): '每日平均' 3-row layout like reference image."""
+
+    # 顶部强调色横条颜色（与各行图标色对应的混合强调色）
+    _accent_strip = QColor("#3b82f6")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -186,6 +191,16 @@ class DailyAvgCardWidget(QtWidgets.QFrame):
         self.val_tok.setText(avg_tokens_str)
         self.val_cost.setText(f"${avg_cost:.4f}")
 
+    def paintEvent(self, event):
+        """先绘制默认背景，再在顶部绘制 3px 强调色横条。"""
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QBrush(self._accent_strip))
+        painter.setPen(Qt.NoPen)
+        # 顶部 3px 强调色横条，与圆角对齐
+        painter.drawRoundedRect(QRectF(0, 0, self.width(), 3), 2, 2)
+
 
 class StandardCardWidget(QtWidgets.QFrame):
     """Cards 2-7: Top Title + Icon badge, Large Metric Value, Subtitle details, Sparkline."""
@@ -245,6 +260,15 @@ class StandardCardWidget(QtWidgets.QFrame):
         if spark_data is not None:
             self.spark.set_data(spark_data, self.accent_color)
 
+    def paintEvent(self, event):
+        """先绘制默认背景，再在顶部绘制 3px 强调色横条。"""
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QBrush(QColor(self.accent_color)))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(QRectF(0, 0, self.width(), 3), 2, 2)
+
 
 class HeatmapGridWidget(QtWidgets.QWidget):
     """Activity matrix heatmap for Tokens or Health status."""
@@ -258,6 +282,16 @@ class HeatmapGridWidget(QtWidgets.QWidget):
         self.radius = 3.5
         self.setMinimumHeight(140)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        # U-2：启用鼠标追踪以显示悬停 Tooltip
+        self.setMouseTracking(True)
+        # 缓存网格几何信息，供 mouseMoveEvent 命中测试使用
+        self._grid_rows = 7
+        self._grid_cols = 0
+        self._cell_size = 0
+        self._step_x = 0
+        self._step_y = 0
+        self._offset_x = 0
+        self._offset_y = 0
 
     def set_theme_colors(self, c):
         self.theme_colors = c
@@ -330,6 +364,15 @@ class HeatmapGridWidget(QtWidgets.QWidget):
         offset_x = max(int((w - total_w) / 2), 0)
         offset_y = max(int((h - total_h) / 2), 0)
 
+        # 缓存网格几何，供 mouseMoveEvent 命中测试
+        self._grid_rows = rows
+        self._grid_cols = cols
+        self._cell_size = cell_size
+        self._step_x = step_x
+        self._step_y = step_y
+        self._offset_x = offset_x
+        self._offset_y = offset_y
+
         max_token = max([d.get("tokens", 0) for d in self.data] or [1])
 
         for idx, item in enumerate(self.data):
@@ -348,6 +391,52 @@ class HeatmapGridWidget(QtWidgets.QWidget):
             painter.setPen(Qt.NoPen)
             rect = QRectF(x, y, cell_size, cell_size)
             painter.drawRoundedRect(rect, self.radius, self.radius)
+
+    def _cell_index_at(self, pos):
+        """根据鼠标坐标返回命中的单元格在 self.data 中的索引，未命中返回 -1。"""
+        x, y = pos.x(), pos.y()
+        cs = self._cell_size
+        if cs <= 0 or self._grid_cols <= 0:
+            return -1
+        # 反推列/行：相对偏移
+        rel_x = x - self._offset_x
+        rel_y = y - self._offset_y
+        if rel_x < 0 or rel_y < 0:
+            return -1
+        col = int(rel_x / self._step_x)
+        row = int(rel_y / self._step_y)
+        # 落在间隔里算未命中
+        if (rel_x - col * self._step_x) > cs or (rel_y - row * self._step_y) > cs:
+            return -1
+        if col < 0 or col >= self._grid_cols or row < 0 or row >= self._grid_rows:
+            return -1
+        idx = col * self._grid_rows + row
+        if 0 <= idx < len(self.data):
+            return idx
+        return -1
+
+    def mouseMoveEvent(self, event):
+        """U-2：悬停在热力图色块上时显示 Tooltip（日期/请求数/Token 数）。"""
+        idx = self._cell_index_at(event.pos())
+        if idx < 0:
+            QtWidgets.QToolTip.hideText()
+            return
+        item = self.data[idx]
+        date = item.get("date", "")
+        calls = item.get("calls", 0)
+        if self.mode == "tokens":
+            tokens = item.get("tokens", 0)
+            inp = item.get("input", 0)
+            out = item.get("output", 0)
+            tooltip = f"{date}：{calls} 次请求，{tokens:,} Tokens\n输入 {inp:,}  输出 {out:,}"
+        else:
+            succ = item.get("success", 0)
+            fail = item.get("fail", 0)
+            rate = item.get("rate", 1.0)
+            tooltip = f"{date}：{calls} 次请求，成功率 {rate*100:.1f}%\n成功 {succ}  失败 {fail}"
+        if calls <= 0:
+            tooltip = f"{date}：无活动"
+        QtWidgets.QToolTip.showText(event.globalPos(), tooltip, self)
 
 
 class HeatmapLegendWidget(QtWidgets.QWidget):
@@ -447,78 +536,135 @@ class ModelUsageListWidget(QtWidgets.QWidget):
         self.layout = QtWidgets.QVBoxLayout(self)
         self.layout.setContentsMargins(14, 12, 14, 12)
         self.layout.setSpacing(10)
+        # 复用的卡片控件列表，避免每次刷新全量重建（P-4）
+        self._model_cards = []
+        self._empty_label = None
+        # 主题色板，由 dashboard_tab 传入
+        self.theme_colors = None
+
+    def set_theme_colors(self, c):
+        self.theme_colors = c
+        # 刷新已有卡片的颜色
+        if self._model_cards:
+            self._refresh_card_colors()
+
+    def _palette(self):
+        """从主题色派生颜色列表（U-10），缺省回退到固定色板。"""
+        c = self.theme_colors
+        if c:
+            return [c["accent"], c["green"], c["accent_2"], c["yellow"],
+                    c["blue"], c["red"], c["text_dim"]]
+        return ["#3b82f6", "#10b981", "#8b5cf6", "#f59e0b",
+                "#06b6d4", "#ec4899", "#64748b"]
+
+    def _refresh_card_colors(self):
+        """主题切换后更新已有卡片的颜色。"""
+        palette = self._palette()
+        for idx, entry in enumerate(self._model_cards):
+            color = palette[idx % len(palette)]
+            entry["color"] = color
+            entry["val"].setStyleSheet(f"font-size: 11px; font-weight: 700; color: {color};")
+            entry["pbar"].setStyleSheet(
+                f"QProgressBar#modelProgressBar::chunk {{ background: {color}; border-radius: 2px; }}"
+            )
 
     def update_models(self, models_dict, total_tokens):
-        while self.layout.count():
-            child = self.layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+        from analytics import format_number_compact
 
-        if not models_dict or total_tokens <= 0:
-            empty = QtWidgets.QLabel("暂无调用记录")
-            empty.setStyleSheet("color: #94a3b8; font-size: 12px; padding: 20px;")
-            empty.setAlignment(Qt.AlignCenter)
-            self.layout.addWidget(empty)
-            return
-
+        palette = self._palette()
         sorted_models = sorted(models_dict.items(), key=lambda x: x[1]["total"], reverse=True)
         top_models = sorted_models[:8]
 
-        colors = ["#3b82f6", "#10b981", "#8b5cf6", "#f59e0b", "#06b6d4", "#ec4899", "#64748b"]
+        has_data = bool(models_dict) and total_tokens > 0
+        # 空状态：复用或创建一个占位 label
+        if not has_data:
+            for entry in self._model_cards:
+                entry["card"].setVisible(False)
+            if self._empty_label is None:
+                self._empty_label = QtWidgets.QLabel("暂无调用记录")
+                self._empty_label.setStyleSheet("color: #94a3b8; font-size: 12px; padding: 20px;")
+                self._empty_label.setAlignment(Qt.AlignCenter)
+                self.layout.addWidget(self._empty_label)
+            self._empty_label.setVisible(True)
+            return
+        if self._empty_label is not None:
+            self._empty_label.setVisible(False)
+
+        n = len(top_models)
+        # 复用已有卡片：多则隐藏多余，少则补建（P-4，避免视觉闪烁）
+        for i in range(n, len(self._model_cards)):
+            self._model_cards[i]["card"].setVisible(False)
 
         for idx, (mname, stats) in enumerate(top_models):
             tot = stats["total"]
             percent = (tot / total_tokens) * 100
-            color = colors[idx % len(colors)]
+            color = palette[idx % len(palette)]
 
-            card = QtWidgets.QFrame()
-            card.setObjectName("modelCard")
-            clayout = QtWidgets.QVBoxLayout(card)
-            clayout.setContentsMargins(12, 10, 12, 10)
-            clayout.setSpacing(5)
+            if idx < len(self._model_cards):
+                entry = self._model_cards[idx]
+                entry["card"].setVisible(True)
+                entry["name"].setText(mname)
+                tokens_str = format_number_compact(tot)
+                entry["val"].setText(f"{tokens_str} Tokens ({percent:.1f}%)")
+                entry["val"].setStyleSheet(f"font-size: 11px; font-weight: 700; color: {color};")
+                c_read = format_number_compact(stats.get('cacheRead', 0))
+                in_str = format_number_compact(stats.get('input', 0))
+                out_str = format_number_compact(stats.get('output', 0))
+                entry["sub"].setText(
+                    f"调用: {stats['calls']} 次  ·  输入: {in_str}  ·  输出: {out_str}  ·  缓存: {c_read}"
+                )
+                entry["pbar"].setValue(int(percent * 10))
+                entry["pbar"].setStyleSheet(
+                    f"QProgressBar#modelProgressBar::chunk {{ background: {color}; border-radius: 2px; }}"
+                )
+                entry["color"] = color
+            else:
+                # 补建新卡片
+                card = QtWidgets.QFrame()
+                card.setObjectName("modelCard")
+                clayout = QtWidgets.QVBoxLayout(card)
+                clayout.setContentsMargins(12, 10, 12, 10)
+                clayout.setSpacing(5)
 
-            # Top: Model Name + Total Tokens + Percent
-            h_top = QtWidgets.QHBoxLayout()
-            lbl_name = QtWidgets.QLabel(mname)
-            lbl_name.setObjectName("modelName")
+                h_top = QtWidgets.QHBoxLayout()
+                lbl_name = QtWidgets.QLabel(mname)
+                lbl_name.setObjectName("modelName")
+                tokens_str = format_number_compact(tot)
+                lbl_val = QtWidgets.QLabel(f"{tokens_str} Tokens ({percent:.1f}%)")
+                lbl_val.setStyleSheet(f"font-size: 11px; font-weight: 700; color: {color};")
+                h_top.addWidget(lbl_name)
+                h_top.addStretch(1)
+                h_top.addWidget(lbl_val)
+                clayout.addLayout(h_top)
 
-            from analytics import format_number_compact
-            tokens_str = format_number_compact(tot)
-            lbl_val = QtWidgets.QLabel(f"{tokens_str} Tokens ({percent:.1f}%)")
-            lbl_val.setStyleSheet(f"font-size: 11px; font-weight: 700; color: {color};")
+                h_sub = QtWidgets.QHBoxLayout()
+                c_read = format_number_compact(stats.get('cacheRead', 0))
+                in_str = format_number_compact(stats.get('input', 0))
+                out_str = format_number_compact(stats.get('output', 0))
+                sub_text = f"调用: {stats['calls']} 次  ·  输入: {in_str}  ·  输出: {out_str}  ·  缓存: {c_read}"
+                lbl_sub = QtWidgets.QLabel(sub_text)
+                lbl_sub.setObjectName("modelSub")
+                h_sub.addWidget(lbl_sub)
+                h_sub.addStretch(1)
+                clayout.addLayout(h_sub)
 
-            h_top.addWidget(lbl_name)
-            h_top.addStretch(1)
-            h_top.addWidget(lbl_val)
-            clayout.addLayout(h_top)
+                pbar = QtWidgets.QProgressBar()
+                pbar.setFixedHeight(5)
+                pbar.setTextVisible(False)
+                pbar.setRange(0, 1000)
+                pbar.setValue(int(percent * 10))
+                pbar.setObjectName("modelProgressBar")
+                pbar.setStyleSheet(
+                    f"QProgressBar#modelProgressBar::chunk {{ background: {color}; border-radius: 2px; }}"
+                )
+                clayout.addWidget(pbar)
 
-            # Sub-info row
-            h_sub = QtWidgets.QHBoxLayout()
-            c_read = format_number_compact(stats.get('cacheRead', 0))
-            in_str = format_number_compact(stats.get('input', 0))
-            out_str = format_number_compact(stats.get('output', 0))
-            sub_text = f"调用: {stats['calls']} 次  ·  输入: {in_str}  ·  输出: {out_str}  ·  缓存: {c_read}"
-            lbl_sub = QtWidgets.QLabel(sub_text)
-            lbl_sub.setObjectName("modelSub")
-            h_sub.addWidget(lbl_sub)
-            h_sub.addStretch(1)
-            clayout.addLayout(h_sub)
+                self.layout.addWidget(card)
+                self._model_cards.append({
+                    "card": card, "name": lbl_name, "val": lbl_val,
+                    "sub": lbl_sub, "pbar": pbar, "color": color,
+                })
 
-            # Progress Bar
-            pbar = QtWidgets.QProgressBar()
-            pbar.setFixedHeight(5)
-            pbar.setTextVisible(False)
-            pbar.setRange(0, 1000)
-            pbar.setValue(int(percent * 10))
-            pbar.setObjectName("modelProgressBar")
-            pbar.setStyleSheet(f"""
-                QProgressBar#modelProgressBar::chunk {{
-                    background: {color};
-                    border-radius: 2px;
-                }}
-            """)
-            clayout.addWidget(pbar)
-
-            self.layout.addWidget(card)
-
-        self.layout.addStretch(1)
+        # 确保 stretch 项存在一次
+        if self.layout.count() == len(self._model_cards) + (1 if self._empty_label is not None else 0):
+            self.layout.addStretch(1)

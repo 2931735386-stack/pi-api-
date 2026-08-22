@@ -22,13 +22,13 @@ import json
 import os
 import re
 import sys
-import threading
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import QThread, pyqtSignal
 from dashboard_tab import ModernDashboardTab
 
 
@@ -116,7 +116,7 @@ THEMES = {
         "btn_text": "#1c1815",
     },
     # ===== DeepSeek 风格：深蓝底 + 科技青蓝，冷调未来感 =====
-        "deepseek": {
+    "deepseek": {
         "bg": "#0a1428", "bg_alt": "#050b18", "panel": "#11203a", "border": "#1e3050",
         "text": "#dce8f5", "text_dim": "#7890b0",
         "accent": "#1ec8e8", "accent_2": "#4d8aff", "accent_hover": "#3dd9f0",
@@ -187,20 +187,26 @@ def detect_available_fonts():
     families = set(db.families())
     available = []
     if families:
+        # 预建 {字体名小写: 字体名原写} 字典，O(1) 查找
+        families_lower = {fam.lower(): fam for fam in families}
         # 优先匹配常见中文字体名
         for f in FONT_CANDIDATES:
-            for fam in families:
-                if fam.lower() == f.lower() or f in fam:
+            fam = families_lower.get(f.lower())
+            if fam:
+                if fam not in available:
+                    available.append(fam)
+                continue
+            # 宽松匹配：候选名是某字体名的子串
+            for low, fam in families_lower.items():
+                if f in low or low in f.lower():
                     if fam not in available:
                         available.append(fam)
                     break
         # 补充几个常用于代码的英文等宽字体
         for f in ["Consolas", "Cascadia Code", "JetBrains Mono", "Segoe UI Mono"]:
-            for fam in families:
-                if fam.lower() == f.lower():
-                    if fam not in available:
-                        available.append(fam)
-                    break
+            fam = families_lower.get(f.lower())
+            if fam and fam not in available:
+                available.append(fam)
     if not available:
         # offscreen / 无 GUI 后端时退回系统已知可用字体
         available = FONT_CANDIDATES[:6]
@@ -303,15 +309,15 @@ class ConfigStore:
         return self.auth.get(name, {}).get("key", "")
 
     def set_api_key(self, name, key):
-        # 优先内嵌到 models.json 的 apiKey（与你现有 deepseek-v4-pro 的写法一致）
-        p = self.get_provider(name)
-        if p:
-            p["apiKey"] = key
-        # 同时同步 auth.json
+        # 统一只写 auth.json，避免双重存储导致读取优先级歧义
         if key:
             self.auth[name] = {"type": "api_key", "key": key}
         elif name in self.auth:
             del self.auth[name]
+        # 清理 models.json 中可能遗留的内嵌 apiKey 字段
+        p = self.get_provider(name)
+        if p and "apiKey" in p:
+            del p["apiKey"]
 
     def default_provider(self):
         return self.settings.get("defaultProvider", "")
@@ -358,9 +364,8 @@ class ConfigStore:
                 }
             ],
         }
-        if api_key:
-            p["apiKey"] = api_key
         self.models.setdefault("providers", {})[name] = p
+        # API Key 统一只写 auth.json，不再内嵌到 models.json
         if api_key:
             self.auth[name] = {"type": "api_key", "key": api_key}
 
@@ -450,13 +455,17 @@ KNOWN_CONTEXT = {
 }
 
 
+# 模块加载时预排序静态上下文键（按长度降序，精确/较长匹配优先），避免每次调用重排
+_KNOWN_CONTEXT_SORTED = sorted(KNOWN_CONTEXT.keys(), key=len, reverse=True)
+
+
 def lookup_context_window(model_id: str):
     """根据模型 id 在已知对照表中查找上下文窗口，返回 int 或 None。"""
     if not model_id:
         return None
     low = model_id.lower()
-    # 先精确/较长匹配，再短匹配（避免误命中）
-    for key in sorted(KNOWN_CONTEXT.keys(), key=len, reverse=True):
+    # 使用模块加载时预排序的列表，O(n) 查找但避免了重复排序
+    for key in _KNOWN_CONTEXT_SORTED:
         if key in low:
             return KNOWN_CONTEXT[key]
     return None
@@ -716,6 +725,43 @@ def generate_icon_ico(path: Path):
 
 
 # =============================================================================
+# 后台工作线程（统一使用 QThread + pyqtSignal）
+# =============================================================================
+
+class TestEndpointWorker(QThread):
+    """异步测试端点连通性，与 DataLoadWorker 风格一致。"""
+    result_ready = pyqtSignal(str, bool, int, str, str)  # name, ok, latency, msg, payload
+
+    def __init__(self, base_url, api_key, name="", parent=None):
+        super().__init__(parent)
+        self.base_url = base_url
+        self.api_key = api_key
+        self.name = name
+
+    def run(self):
+        ok, latency, msg, model_infos = test_endpoint(self.base_url, self.api_key)
+        payload = json.dumps(model_infos, ensure_ascii=False)
+        self.result_ready.emit(self.name, ok, latency, msg, payload)
+
+
+class ProbeModelsWorker(QThread):
+    """逐个探测模型能力（是否支持图片），每完成一个发信号更新表格。
+    避免同步阻塞主线程。"""
+    result_ready = pyqtSignal(int, str, bool, bool, str)  # row, mid, ok, supports, msg
+
+    def __init__(self, base_url, api_key, selected, parent=None):
+        super().__init__(parent)
+        self.base_url = base_url
+        self.api_key = api_key
+        self.selected = selected  # [(row, mid), ...]
+
+    def run(self):
+        for row, mid in self.selected:
+            ok, supports, msg = probe_model_capability(self.base_url, self.api_key, mid)
+            self.result_ready.emit(row, mid, ok, supports, msg)
+
+
+# =============================================================================
 # 主窗口
 # =============================================================================
 
@@ -737,6 +783,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.font_size = int(self.app_config.get("font_size", 13))
         global COLORS
         COLORS = THEMES.get(self.theme_name, THEMES["terminal"])
+
+        # 测速结果缓存 {provider_name: {"ok": bool, "latency": int}}
+        self._provider_test_results = {}
+        self._batch_test_workers = []
 
         self._build_menu()  # 菜单栏（必须在 _build_ui 前）
         self._build_ui()
@@ -780,6 +830,13 @@ class MainWindow(QtWidgets.QMainWindow):
         title.setObjectName("sidebarTitle")
         lv.addWidget(title)
 
+        # 搜索过滤框
+        self.ed_search = QtWidgets.QLineEdit()
+        self.ed_search.setPlaceholderText("🔍 搜索供应商或模型...")
+        self.ed_search.setObjectName("sidebarSearch")
+        self.ed_search.textChanged.connect(self._on_search_text_changed)
+        lv.addWidget(self.ed_search)
+
         self.list_widget = QtWidgets.QListWidget()
         self.list_widget.setObjectName("providerList")
         self.list_widget.currentItemChanged.connect(self.on_select)
@@ -788,13 +845,23 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_row = QtWidgets.QHBoxLayout()
         self.btn_add = QtWidgets.QPushButton("＋ 添加")
         self.btn_del = QtWidgets.QPushButton("删除")
+        self.btn_test_all = QtWidgets.QPushButton("⚡ 全部测速")
         self.btn_add.setObjectName("accentBtn")
         self.btn_del.setObjectName("dangerBtn")
+        self.btn_test_all.setObjectName("ghostBtn")
+        self.btn_test_all.setToolTip("并发测试所有供应商端点连通性并显示延迟")
         self.btn_add.clicked.connect(self.on_add)
         self.btn_del.clicked.connect(self.on_del)
+        self.btn_test_all.clicked.connect(self.on_test_all_providers)
         btn_row.addWidget(self.btn_add)
         btn_row.addWidget(self.btn_del)
+        btn_row.addWidget(self.btn_test_all)
         lv.addLayout(btn_row)
+
+        self.sidebar_footer = QtWidgets.QLabel("v1.0 · pi API Switcher")
+        self.sidebar_footer.setObjectName("sidebarFooter")
+        self.sidebar_footer.setAlignment(QtCore.Qt.AlignCenter)
+        lv.addWidget(self.sidebar_footer)
 
         config_root.addWidget(left)
 
@@ -814,18 +881,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.empty_hint.setObjectName("emptyHint")
         empty_lay = QtWidgets.QVBoxLayout(self.empty_hint)
         empty_lay.setAlignment(QtCore.Qt.AlignCenter)
-        empty_icon = QtWidgets.QLabel("π")
-        empty_icon.setObjectName("emptyIcon")
-        empty_icon.setAlignment(QtCore.Qt.AlignCenter)
+        self.empty_icon = QtWidgets.QLabel("π")
+        self.empty_icon.setObjectName("emptyIcon")
+        self.empty_icon.setAlignment(QtCore.Qt.AlignCenter)
         empty_text = QtWidgets.QLabel("从左侧选择或添加供应商")
         empty_text.setObjectName("emptyText")
         empty_text.setAlignment(QtCore.Qt.AlignCenter)
         empty_sub = QtWidgets.QLabel("支持管理多个 API 端点，一键切换默认模型")
         empty_sub.setObjectName("emptySubText")
         empty_sub.setAlignment(QtCore.Qt.AlignCenter)
-        empty_lay.addWidget(empty_icon)
+        empty_lay.addWidget(self.empty_icon)
         empty_lay.addWidget(empty_text)
         empty_lay.addWidget(empty_sub)
+
+        # 空状态图标浮动动画
+        self._empty_float_offset = 0.0
+        self._empty_float_dir = 1.0
+        self._empty_timer = QtCore.QTimer(self)
+        self._empty_timer.setInterval(100)
+        self._empty_timer.timeout.connect(self._animate_empty_icon)
+
+        # 可操作的引导按钮：直接复用 on_add
+        self.btn_empty_add = QtWidgets.QPushButton("＋ 添加第一个供应商")
+        self.btn_empty_add.setObjectName("accentBtn")
+        self.btn_empty_add.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_empty_add.setFixedWidth(220)
+        self.btn_empty_add.clicked.connect(self.on_add)
+        empty_lay.addSpacing(12)
+        empty_lay.addWidget(self.btn_empty_add, 0, QtCore.Qt.AlignCenter)
         rv.addWidget(self.empty_hint)
 
         # 表单
@@ -866,6 +949,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ["模型 ID", "显示名", "推理", "输入", "思考上限", "上下文", "最大输出", "视觉模型"]
         )
         self.model_table.setObjectName("modelTable")
+        self.model_table.setAlternatingRowColors(True)
         self.model_table.horizontalHeader().setStretchLastSection(False)
         self.model_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         self.model_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
@@ -892,7 +976,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.model_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.model_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.model_table.verticalHeader().setVisible(False)
-        self.model_table.verticalHeader().setDefaultSectionSize(34)
+        self.model_table.verticalHeader().setDefaultSectionSize(40)
         self.model_table.setMinimumHeight(160)
         rv.addWidget(self.model_table)
 
@@ -962,6 +1046,17 @@ class MainWindow(QtWidgets.QMainWindow):
         return ed
 
     # ---- 样式 ----
+    def _make_theme_icon(self, color_hex):
+        pix = QtGui.QPixmap(14, 14)
+        pix.fill(QtCore.Qt.transparent)
+        p = QtGui.QPainter(pix)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.setBrush(QtGui.QBrush(QtGui.QColor(color_hex)))
+        p.setPen(QtCore.Qt.NoPen)
+        p.drawEllipse(1, 1, 12, 12)
+        p.end()
+        return QtGui.QIcon(pix)
+
     def _build_menu(self):
         """构建顶部菜单栏：外观（主题 + 字体）。"""
         bar = self.menuBar()
@@ -985,7 +1080,8 @@ class MainWindow(QtWidgets.QMainWindow):
         theme_group = QtWidgets.QActionGroup(self)
         theme_group.setExclusive(True)
         for key, label in theme_names.items():
-            act = menu_theme.addAction(label)
+            t_clr = THEMES.get(key, {}).get("accent", "#3b82f6")
+            act = menu_theme.addAction(self._make_theme_icon(t_clr), label)
             act.setCheckable(True)
             act.setChecked(key == self.theme_name)
             theme_group.addAction(act)
@@ -1031,7 +1127,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_style()
         if hasattr(self, 'dashboard_tab') and hasattr(self.dashboard_tab, '_apply_theme_to_children'):
             self.dashboard_tab._apply_theme_to_children(COLORS)
-        self.status.setText(f"已切换主题：{name}")
+        self.set_status(f"已切换主题：{name}", "ok")
+        self.show_toast(f"🎨 已应用主题：{name}")
 
     def _switch_font(self, family):
         self.font_family = family
@@ -1039,7 +1136,8 @@ class MainWindow(QtWidgets.QMainWindow):
         _save_app_config(self.app_config)
         self._apply_font()
         self._apply_style()
-        self.status.setText(f"已切换字体：{family or '跟随系统'}")
+        self.set_status(f"已切换字体：{family or '跟随系统'}", "ok")
+        self.show_toast(f"🔤 字体已切换：{family or '跟随系统'}")
 
     def _switch_font_size(self, size):
         self.font_size = size
@@ -1047,7 +1145,8 @@ class MainWindow(QtWidgets.QMainWindow):
         _save_app_config(self.app_config)
         self._apply_font()
         self._apply_style()
-        self.status.setText(f"已切换字号：{size} px")
+        self.set_status(f"已切换字号：{size} px", "ok")
+        self.show_toast(f"🔍 字号已设为：{size} px")
 
     def _apply_font(self):
         """统一设置全局字体。"""
@@ -1059,16 +1158,45 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.instance().setFont(font)
 
     def _apply_style(self):
+        """重新生成并应用全局样式表。"""
         c = THEMES.get(self.theme_name, THEMES["terminal"])
-        bt = c["btn_text"]
-        accent2_hover = c["accent_2"]
-        # 计算半透明色用于微妙效果
-        panel_dim = c["panel"]
-        self.setStyleSheet(f"""
+        parts = [
+            self._qss_global(c),
+            self._qss_menubar(c),
+            self._qss_sidebar(c),
+            self._qss_content(c),
+            self._qss_empty_state(c),
+            self._qss_model_table(c),
+            self._qss_inputs(c),
+            self._qss_buttons(c),
+            self._qss_status(c),
+            self._qss_tabs(c),
+            self._qss_cards(c),
+            self._qss_filter_bar(c),
+            self._qss_scrollbar(c),
+        ]
+        self.setStyleSheet("\n".join(parts))
+
+    @staticmethod
+    def _qss_global(c):
+        return f"""
             /* === 全局 === */
             QMainWindow, QWidget {{ background: {c['bg']}; color: {c['text']}; }}
             QLabel {{ color: {c['text_dim']}; font-size: 13px; }}
+            QToolTip {{
+                background-color: {c['panel']};
+                color: {c['text']};
+                border: 1px solid {c['accent']};
+                border-radius: 6px;
+                padding: 5px 8px;
+                font-size: 12px;
+            }}
+        """
 
+    @staticmethod
+    def _qss_menubar(c):
+        bt = c["btn_text"]
+        return f"""
             /* === 菜单栏 === */
             QMenuBar {{ background: {c['bg_alt']}; color: {c['text_dim']};
                          border-bottom: 1px solid {c['border']}; padding: 3px 8px; }}
@@ -1080,27 +1208,53 @@ class MainWindow(QtWidgets.QMainWindow):
             QMenu::item {{ padding: 7px 28px 7px 20px; border-radius: 6px; font-size: 13px; }}
             QMenu::item:selected {{ background: {c['accent']}; color: {bt}; }}
             QMenu::separator {{ height: 1px; background: {c['border']}; margin: 4px 10px; }}
+        """
 
+    @staticmethod
+    def _qss_sidebar(c):
+        return f"""
             /* === 侧边栏 === */
             #sidebar {{ background: {c['bg_alt']};
                          border-right: 1px solid {c['border']}; }}
             #sidebarTitle {{ font-size: 15px; font-weight: 700; color: {c['accent']};
                               padding: 6px 4px 2px 4px; letter-spacing: 0.5px; }}
+            #sidebarSearch {{
+                background: {c['panel']};
+                border: 1px solid {c['border']};
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 12px;
+                color: {c['text']};
+                margin-bottom: 4px;
+            }}
+            #sidebarSearch:focus {{
+                border-color: {c['accent']};
+            }}
+            #sidebarFooter {{ color: {c['text_dim']}; font-size: 11px; padding: 6px 0 2px 0; opacity: 0.7; }}
             #providerList {{ background: transparent; border: none; outline: none; font-size: 13px; }}
             #providerList::item {{ padding: 11px 10px; border-radius: 8px; margin: 1px 0;
                                     border-left: 3px solid transparent; }}
             #providerList::item:selected {{ background: {c['panel']}; color: {c['accent']};
                                              border-left: 3px solid {c['accent']}; font-weight: 600; }}
             #providerList::item:hover:!selected {{ background: {c['panel']}; }}
+        """
 
+    @staticmethod
+    def _qss_content(c):
+        return f"""
             /* === 右侧内容区 === */
             #content {{ background: {c['bg']}; }}
             #detailTitle {{ font-size: 24px; font-weight: 700; color: {c['text']};
                              padding: 2px 0 4px 0; letter-spacing: -0.3px; }}
             #sectionLabel {{ font-size: 13px; font-weight: 600; color: {c['text']};
-                              margin-top: 8px; margin-bottom: 2px;
-                              border-bottom: 1px solid {c['border']}; padding-bottom: 4px; }}
+                              margin-top: 10px; margin-bottom: 4px;
+                              border-left: 3px solid {c['accent']}; border-bottom: none;
+                              padding-left: 8px; }}
+        """
 
+    @staticmethod
+    def _qss_empty_state(c):
+        return f"""
             /* === 空状态 === */
             #emptyHint {{ background: transparent; }}
             #emptyIcon {{ font-size: 64px; color: {c['border']}; font-weight: 300;
@@ -1108,7 +1262,11 @@ class MainWindow(QtWidgets.QMainWindow):
             #emptyText {{ color: {c['text_dim']}; font-size: 16px; font-weight: 500;
                            padding: 0; }}
             #emptySubText {{ color: {c['border']}; font-size: 13px; padding-top: 4px; }}
+        """
 
+    @staticmethod
+    def _qss_model_table(c):
+        return f"""
             /* === 模型表格 === */
             #modelTable {{
                 background: {c['panel']};
@@ -1122,6 +1280,9 @@ class MainWindow(QtWidgets.QMainWindow):
             }}
             #modelTable::item {{
                 padding: 5px 8px;
+            }}
+            #modelTable::item:alternate {{
+                background: {c['bg_alt']};
             }}
             #modelTable::item:selected {{
                 background: {c['bg_alt']};
@@ -1152,14 +1313,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 font-size: 12px;
                 font-weight: 600;
             }}
-
             /* === 进度条 === */
             QProgressBar#modelProgressBar {{
                 background: {c['border']};
                 border-radius: 2px;
                 border: none;
             }}
+        """
 
+    @staticmethod
+    def _qss_inputs(c):
+        bt = c["btn_text"]
+        return f"""
             /* === 输入框 === */
             QLineEdit {{ background: {c['panel']}; border: 1px solid {c['border']}; border-radius: 6px;
                          padding: 9px 12px; font-size: 13px; color: {c['text']}; }}
@@ -1175,7 +1340,13 @@ class MainWindow(QtWidgets.QMainWindow):
                                             border: 1px solid {c['border']}; border-radius: 6px;
                                             selection-background-color: {c['accent']};
                                             selection-color: {bt}; outline: none; }}
+        """
 
+    @staticmethod
+    def _qss_buttons(c):
+        bt = c["btn_text"]
+        accent2_hover = c["accent_2"]
+        return f"""
             /* === 按钮 === */
             QPushButton {{ border: none; border-radius: 6px; padding: 9px 18px;
                             font-size: 13px; font-weight: 600; }}
@@ -1198,7 +1369,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         border-radius: 6px; font-size: 15px; }}
             #eyeBtn:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
             #eyeBtn:checked {{ background: {c['accent']}; color: {bt}; border-color: {c['accent']}; }}
+        """
 
+    @staticmethod
+    def _qss_status(c):
+        return f"""
             /* === 默认标记 & 状态栏 === */
             #defaultBadge {{ color: {c['green']}; font-size: 13px; font-weight: 600;
                               padding: 4px 0; }}
@@ -1206,7 +1381,11 @@ class MainWindow(QtWidgets.QMainWindow):
                           border-top: 1px solid {c['border']}; }}
             #loadingDots {{ color: {c['accent']}; font-size: 14px; font-weight: 700;
                              padding-top: 8px; min-width: 24px; }}
+        """
 
+    @staticmethod
+    def _qss_tabs(c):
+        return f"""
             /* === 现代主选项卡 (Tabs) === */
             QTabWidget#mainTabs::pane {{
                 border: none;
@@ -1233,17 +1412,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 background: {c['panel']};
                 color: {c['text']};
             }}
+            /* === 全局 Toast 提示胶囊 === */
+            #toastWidget {{
+                background: {c['panel']};
+                border: 1.5px solid {c['accent']};
+                border-radius: 20px;
+            }}
+            #toastText {{
+                font-size: 13px;
+                font-weight: 700;
+                color: {c['text']};
+            }}
+        """
 
+    @staticmethod
+    def _qss_cards(c):
+        return f"""
             /* === KPI 卡片微拟态容器与文字层次 === */
             QFrame#kpiCard {{
                 background-color: {c['panel']};
                 border: 1px solid {c['border']};
                 border-radius: 14px;
             }}
+            QFrame#kpiCard:hover {{
+                border: 1px solid {c['accent']};
+            }}
             QFrame#modelCard {{
                 background-color: {c['bg_alt']};
                 border: 1px solid {c['border']};
                 border-radius: 8px;
+            }}
+            QFrame#modelCard:hover {{
+                border: 1px solid {c['accent']};
             }}
             QLabel#cardTitle {{
                 font-size: 13px;
@@ -1301,7 +1501,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 font-size: 10px;
                 color: {c['text_dim']};
             }}
+        """
 
+    @staticmethod
+    def _qss_filter_bar(c):
+        return f"""
             /* === Segmented Filter Buttons === */
             QFrame#segmentedFilterBox {{
                 background: {c['bg_alt']};
@@ -1335,22 +1539,142 @@ class MainWindow(QtWidgets.QMainWindow):
                 background: {c['bg_alt']};
                 border-color: {c['accent']};
             }}
-        """)
+        """
+
+    @staticmethod
+    def _qss_scrollbar(c):
+        """细条圆角滚动条，与主题协调（隐藏默认箭头按钮）。"""
+        return f"""
+            /* === 滚动条（细条圆角，主题化） === */
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 8px;
+                margin: 2px 0;
+                border: none;
+            }}
+            QScrollBar:horizontal {{
+                background: transparent;
+                height: 8px;
+                margin: 0 2px;
+                border: none;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {c['border']};
+                border-radius: 3px;
+                min-height: 24px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {c['border']};
+                border-radius: 3px;
+                min-width: 24px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {c['text_dim']};
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background: {c['text_dim']};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                background: none;
+                border: none;
+                width: 0;
+                height: 0;
+            }}
+            QScrollBar::add-page, QScrollBar::sub-page {{
+                background: transparent;
+            }}
+        """
 
     # ---- 数据刷新 ----
-    def refresh_list(self, select_name=None):
+    # Provider 名称前缀 → emoji 图标映射（便于侧边栏快速定位）
+    _PROVIDER_ICONS = {
+        "deepseek": "🌊",
+        "claude": "🟠",
+        "anthropic": "🟠",
+        "openai": "🟢",
+        "kimi": "🌙",
+        "moonshot": "🌙",
+        "glm": "💎",
+        "zhipu": "💎",
+        "gemini": "✨",
+        "google": "✨",
+        "qwen": "🐉",
+        "grok": "⚡",
+        "llama": "🦙",
+        "mistral": "🌀",
+    }
+
+    def _provider_icon(self, name):
+        """根据 provider 名称前缀返回 emoji 图标。"""
+        low = (name or "").lower()
+        for prefix, icon in self._PROVIDER_ICONS.items():
+            if prefix in low:
+                return icon
+        return "🔌"
+
+    def _animate_empty_icon(self):
+        """空状态 π 图标缓慢上下浮动动画。"""
+        self._empty_float_offset += 0.5 * self._empty_float_dir
+        if abs(self._empty_float_offset) >= 5:
+            self._empty_float_dir *= -1
+        c = THEMES.get(self.theme_name, THEMES["terminal"])
+        border_clr = c.get("border", "#e2e8f0")
+        self.empty_icon.setStyleSheet(
+            f"font-size: 64px; color: {border_clr}; font-weight: 300; "
+            f"padding-bottom: {8 + self._empty_float_offset:.1f}px;"
+        )
+
+    def _on_search_text_changed(self, text):
+        """左侧列表即时搜索过滤。"""
+        self.refresh_list(keep_selection=True)
+
+    def refresh_list(self, select_name=None, keep_selection=False):
+        current_sel = self.current_name() if keep_selection else select_name
         self.list_widget.clear()
         names = self.store.provider_names()
         default = self.store.default_provider()
+        search_kw = getattr(self, "ed_search", None).text().strip().lower() if hasattr(self, "ed_search") else ""
+
         for name in names:
+            p = self.store.get_provider(name)
+            models = p.get("models", [])
+            m_count = len(models)
+
+            # 搜索过滤匹配（provider 名、base_url、或模型 id/name）
+            if search_kw:
+                match_p = search_kw in name.lower() or search_kw in (p.get("baseUrl", "")).lower()
+                match_m = any(search_kw in (m.get("id", "")).lower() or search_kw in (m.get("name", "")).lower() for m in models)
+                if not (match_p or match_m):
+                    continue
+
             marker = "★ " if name == default else "   "
-            item = QtWidgets.QListWidgetItem(f"{marker}{name}")
+            icon = self._provider_icon(name)
+            # 测速指示状态
+            test_res = self._provider_test_results.get(name)
+            latency_badge = ""
+            if test_res:
+                if test_res.get("ok"):
+                    lat = test_res.get("latency", 0)
+                    dot = "🟢" if lat < 600 else "🟡"
+                    latency_badge = f" {dot}{lat}ms"
+                else:
+                    latency_badge = " 🔴超时"
+
+            item = QtWidgets.QListWidgetItem(f"{icon} {marker}{name} ({m_count}模型){latency_badge}")
             item.setData(QtCore.Qt.UserRole, name)
             self.list_widget.addItem(item)
+
         # 空状态：无 provider 时显示引导，隐藏表单
         has_any = len(names) > 0
         self.empty_hint.setVisible(not has_any)
         self.detail_title.setVisible(has_any)
+        if not has_any:
+            if hasattr(self, '_empty_timer') and not self._empty_timer.isActive():
+                self._empty_timer.start()
+        else:
+            if hasattr(self, '_empty_timer') and self._empty_timer.isActive():
+                self._empty_timer.stop()
         # 隐藏/显示表单区域
         for w in [self.ed_baseurl.parentWidget() or self.ed_baseurl,
                   self.ed_apikey.parentWidget() or self.ed_apikey,
@@ -1358,32 +1682,74 @@ class MainWindow(QtWidgets.QMainWindow):
                   self.lbl_default]:
             if w:
                 w.setVisible(has_any)
-        if select_name:
+        if current_sel:
             for i in range(self.list_widget.count()):
-                if self.list_widget.item(i).data(QtCore.Qt.UserRole) == select_name:
+                if self.list_widget.item(i).data(QtCore.Qt.UserRole) == current_sel:
                     self.list_widget.setCurrentRow(i)
                     break
-        elif names:
+        elif self.list_widget.count() > 0:
             self.list_widget.setCurrentRow(0)
 
-    def _is_dirty(self) -> bool:
-        """检测当前表单/表格是否有未保存的改动。"""
-        name = self.current_name()
+    def on_test_all_providers(self):
+        """并发测速所有 Provider 端点并更新侧边栏呼吸灯与延迟。"""
+        names = self.store.provider_names()
+        if not names:
+            self.set_status("无可用供应商", "warn")
+            return
+        self.btn_test_all.setEnabled(False)
+        self.set_status(f"正在并发测速 {len(names)} 个供应商端点...", "info")
+        self.show_toast(f"⚡ 开始测试 {len(names)} 个端点...")
+
+        self._pending_batch_count = len(names)
+        self._batch_test_workers.clear()
+
+        for name in names:
+            p = self.store.get_provider(name)
+            base_url = p.get("baseUrl", "").strip()
+            key = self.store.api_key(name)
+            if not base_url:
+                self._on_single_provider_tested(name, False, 0, "Base URL 为空", "[]")
+                continue
+            worker = TestEndpointWorker(base_url, key, name=name, parent=self)
+            worker.result_ready.connect(self._on_single_provider_tested)
+            self._batch_test_workers.append(worker)
+            worker.start()
+
+    @QtCore.pyqtSlot(str, bool, int, str, str)
+    def _on_single_provider_tested(self, name, ok, latency, msg, payload):
+        self._provider_test_results[name] = {"ok": ok, "latency": latency, "msg": msg}
+        self.refresh_list(keep_selection=True)
+        if hasattr(self, "_pending_batch_count"):
+            self._pending_batch_count -= 1
+            if self._pending_batch_count <= 0:
+                self.btn_test_all.setEnabled(True)
+                succ_cnt = sum(1 for v in self._provider_test_results.values() if v.get("ok"))
+                self.set_status(f"测速完成：{succ_cnt}/{len(self._provider_test_results)} 个端点正常", "ok")
+                self.show_toast(f"✓ 测速完成：{succ_cnt} 个端点正常")
+
+    def _is_dirty_for(self, name: str) -> bool:
+        """检测指定 provider 的表单内容是否有未保存改动（明确传 name，不依赖 currentItem）。
+
+        根本原因：currentItemChanged 触发时 currentItem() 已指向新选中项。
+        若直接调用 _is_dirty()，会拿新 provider 的存储数据与旧表单内容比较，
+        永远不相等 → 每次切换都误弹「未保存的改动」弹窗。
+        """
         if not name:
             return False
         p = self.store.get_provider(name)
+        if not p:
+            return False
         # Base URL
         if self.ed_baseurl.text().strip() != (p.get("baseUrl") or ""):
             return True
-        # API Key（掩码比对：只看长度变化或前缀，避免明文存储）
+        # API Key
         cur_key = self.ed_apikey.text().strip()
-        saved_key = self.store.api_key(name)
-        if cur_key != saved_key:
+        if cur_key != (self.store.api_key(name) or ""):
             return True
         # 显示名
         if self.ed_model_name.text().strip() != (p.get("name") or ""):
             return True
-        # 模型表格：读取当前表格与存储的 models 对比
+        # 模型表格
         table_models = self._read_model_table()
         stored_models = p.get("models", [])
         if len(table_models) != len(stored_models):
@@ -1397,22 +1763,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 return True
             if tm.get("input") != sm.get("input"):
                 return True
-            # 思考上限对比
             if get_max_thinking_level(tm) != get_max_thinking_level(sm):
                 return True
-            # 上下文窗口 / 最大输出对比
             if tm.get("contextWindow", 128000) != sm.get("contextWindow", 128000):
                 return True
             if tm.get("maxTokens", 16384) != sm.get("maxTokens", 16384):
                 return True
-            # 视觉插件对比
             if tm.get("visionModel", "") != sm.get("visionModel", ""):
                 return True
         return False
 
-    def _confirm_discard(self) -> bool:
-        """有未保存改动时弹窗确认是否丢弃。返回 True 表示可以继续切换。"""
-        if not self._is_dirty():
+    def _is_dirty(self) -> bool:
+        """检测当前表单/表格是否有未保存的改动（保存/关闭等场景）。"""
+        return self._is_dirty_for(self.current_name() or "")
+
+    def _confirm_discard(self, prev_name: str = None) -> bool:
+        """有未保存改动时弹窗确认是否丢弃。返回 True 表示可以继续切换。
+        prev_name：切换前的 provider 名，传入时对该 provider 做检测；
+                   不传时回退到 _is_dirty()（用于非切换场景）。"""
+        dirty = self._is_dirty_for(prev_name) if prev_name else self._is_dirty()
+        if not dirty:
             return True
         ret = QtWidgets.QMessageBox.question(
             self, "未保存的改动",
@@ -1422,18 +1792,20 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         return ret == QtWidgets.QMessageBox.Yes
 
-    def on_select(self, current, _prev):
+    def on_select(self, current, prev):
         if not current:
             return
-        # 切换前检测未保存改动
-        if self.current_name() and current.data(QtCore.Qt.UserRole) != self.current_name():
-            if not self._confirm_discard():
-                # 用户取消：选回原来的项
-                prev_name = self.current_name()
+        prev_name = prev.data(QtCore.Qt.UserRole) if prev else None
+        # 关键修复：明确传 prev_name，避免 currentItem() 已切换导致误判
+        if prev_name and current.data(QtCore.Qt.UserRole) != prev_name:
+            if not self._confirm_discard(prev_name):
+                # 用户取消：选回原来的项，用 blockSignals 避免触发递归
+                self.list_widget.blockSignals(True)
                 for i in range(self.list_widget.count()):
                     if self.list_widget.item(i).data(QtCore.Qt.UserRole) == prev_name:
-                        # 防递归：暂时记录
-                        pass
+                        self.list_widget.setCurrentRow(i)
+                        break
+                self.list_widget.blockSignals(False)
                 return
         name = current.data(QtCore.Qt.UserRole)
         p = self.store.get_provider(name)
@@ -1445,12 +1817,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # 填充模型表格（多模型）
         self._fill_model_table(p.get("models", []))
 
-        # 默认标记
+        # 默认标记（胶囊徽章样式）
         is_default = name == self.store.default_provider()
         if is_default:
-            self.lbl_default.setText(f"✓ 当前默认 · {self.store.default_model()}")
+            c = THEMES.get(self.theme_name, THEMES["terminal"])
+            g_clr = c.get("green", "#10b981")
+            self.lbl_default.setText(f"  ✓ 当前默认模型 · {self.store.default_model()}  ")
+            self.lbl_default.setStyleSheet(
+                f"background: {g_clr}1e; color: {g_clr}; "
+                f"border: 1px solid {g_clr}44; border-radius: 10px; padding: 4px 10px; font-weight: 600;"
+            )
         else:
             self.lbl_default.setText("")
+            self.lbl_default.setStyleSheet("")
 
     def _fill_model_table(self, models):
         """将模型列表填到表格中。"""
@@ -1646,20 +2025,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if row < 0:
             return
 
-        # 收集所有可用的视觉模型（input 含 image 的模型），跨所有 provider
-        candidates = []  # (label, vision_model_str)
-        for pname in self.store.provider_names():
-            p = self.store.get_provider(pname)
-            for m in p.get("models", []):
-                inputs = m.get("input", ["text"])
-                if "image" not in inputs:
-                    continue
-                mid = m.get("id", "")
-                if not mid:
-                    continue
-                mname = m.get("name", mid)
-                label = f"{pname} / {mname} ({mid})"
-                candidates.append((label, f"{pname}:{mid}"))
+        # 复用已有方法收集所有可用的视觉模型，避免内联重复逻辑
+        candidates = self._collect_vision_candidates()
 
         if not candidates:
             QtWidgets.QMessageBox.information(
@@ -1739,7 +2106,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         label, vision_str = candidates[sel]
         self._update_vision_btn(btn, vision_str, input_types, model_name)
-        self.status.setText(f"已挂接视觉插件：{label}（记得点保存）")
+        self.set_status(f"已挂接视觉插件：{label}（记得点保存）", "info")
 
     def _read_model_table(self):
         """从表格读取模型列表（忽略空 ID 的行）。"""
@@ -1866,7 +2233,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.store.save()
         self.refresh_list()
         self._refresh_tray()
-        self.status.setText(f"已删除 {name}")
+        self.set_status(f"已删除 {name}", "ok")
 
     def _refresh_tray(self):
         if self.tray is not None:
@@ -1875,7 +2242,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_save(self):
         name = self.current_name()
         if not name:
-            self.status.setText("请先选择供应商")
+            self.set_status("请先选择供应商", "warn")
             return
         p = self.store.get_provider(name)
         base_url = self.ed_baseurl.text().strip()
@@ -1906,11 +2273,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.store.set_api_key(name, key)
 
         if self.store.save():
-            self.status.setText(f"已保存 {name}（{len(models)} 个模型）· 重启 pi 或执行 /reload 生效")
+            self.set_status(f"已保存 {name}（{len(models)} 个模型）· 重启 pi 或执行 /reload 生效", "ok")
+            self.show_toast(f"💾 已成功保存配置：{name}")
             self.refresh_list(select_name=name)
             self._refresh_tray()
         else:
-            self.status.setText("保存失败")
+            self.set_status("保存失败", "err")
+            self.show_toast("❌ 保存失败，请检查文件写入权限", 3000)
 
     def on_set_default(self):
         name = self.current_name()
@@ -1930,14 +2299,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.store.set_default(name, model_id)
         self.store.save()
-        self.status.setText(f"已将 {name}/{model_id} 设为默认（pi 下次启动生效）")
+        self.set_status(f"已将 {name}/{model_id} 设为默认（pi 下次启动生效）", "ok")
+        self.show_toast(f"⭐ 已设为默认模型：{name} / {model_id}")
         self.refresh_list(select_name=name)
         self._refresh_tray()
 
     def _animate_loading(self):
-        """动态省略号动画。"""
-        self._loading_dots_count = (self._loading_dots_count + 1) % 4
-        self.loading_dots.setText("." * (self._loading_dots_count + 1))
+        """Braille 旋转 Spinner 动画。"""
+        frames = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
+        self._loading_dots_count = (self._loading_dots_count + 1) % len(frames)
+        self.loading_dots.setText(frames[self._loading_dots_count])
 
     def closeEvent(self, event):
         self._closed = True
@@ -1950,27 +2321,61 @@ class MainWindow(QtWidgets.QMainWindow):
         base_url = self.ed_baseurl.text().strip()
         key = self.ed_apikey.text().strip()
         if not base_url:
-            self.status.setText("Base URL 为空")
+            self.set_status("Base URL 为空", "err")
             return
-        self.status.setText(f"正在测试 {name}")
+        self.set_status(f"正在测试 {name}", "info")
         self.loading_dots.setVisible(True)
         self._loading_dots_count = 0
         self._loading_timer.start()
         self.btn_test.setEnabled(False)
         self._testing = True
 
-        def run():
-            ok, latency, msg, model_infos = test_endpoint(base_url, key)
-            # dict 列表无法直接用 Qt 信号传递，序列化为 JSON 字符串
-            payload = json.dumps(model_infos, ensure_ascii=False)
-            QtCore.QMetaObject.invokeMethod(
-                self, "_on_test_done", QtCore.Qt.QueuedConnection,
-                QtCore.Q_ARG(str, name), QtCore.Q_ARG(bool, ok),
-                QtCore.Q_ARG(int, latency), QtCore.Q_ARG(str, msg),
-                QtCore.Q_ARG(str, payload),
-            )
+        # 统一使用 QThread + pyqtSignal（与 DataLoadWorker 一致）
+        self._test_worker = TestEndpointWorker(base_url, key)
+        self._test_worker.result_ready.connect(self._on_test_done)
+        self._test_worker.start()
 
-        threading.Thread(target=run, daemon=True).start()
+    def show_toast(self, message, duration=2200):
+        """在窗口中上方弹出平滑淡入淡出的现代胶囊 Toast 提示。"""
+        if hasattr(self, "_toast_label") and self._toast_label:
+            self._toast_label.deleteLater()
+            self._toast_label = None
+
+        toast = QtWidgets.QFrame(self)
+        toast.setObjectName("toastWidget")
+        toast.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+
+        layout = QtWidgets.QHBoxLayout(toast)
+        layout.setContentsMargins(18, 8, 18, 8)
+        lbl = QtWidgets.QLabel(message, toast)
+        lbl.setObjectName("toastText")
+        layout.addWidget(lbl)
+
+        toast.adjustSize()
+        # 居中偏上位置
+        x = (self.width() - toast.width()) // 2
+        y = 48
+        toast.move(x, y)
+        toast.show()
+        self._toast_label = toast
+
+        # 渐隐定时器
+        QtCore.QTimer.singleShot(duration, toast.deleteLater)
+
+    def set_status(self, msg, level="info"):
+        """统一状态栏消息，按级别着色。
+        level: ok(绿) | err(红) | warn(黄) | info(灰)"""
+        c = THEMES.get(self.theme_name, THEMES["terminal"])
+        color_map = {
+            "ok": c.get("green", "#10b981"),
+            "err": c.get("red", "#ef4444"),
+            "warn": c.get("yellow", "#f59e0b"),
+            "info": c.get("text_dim", "#64748b"),
+        }
+        color = color_map.get(level, color_map["info"])
+        self.status.setText(msg)
+        self.status.setStyleSheet(f"color: {color}; font-size: 12px; padding-top: 8px; "
+                                 f"border-top: 1px solid {c['border']};")
 
     @QtCore.pyqtSlot(str, bool, int, str, str)
     def _on_test_done(self, name, ok, latency, msg, payload):
@@ -1993,12 +2398,12 @@ class MainWindow(QtWidgets.QMainWindow):
         icon = "✓" if ok else "✗"
         if ok:
             n = len(model_infos)
-            self.status.setText(f"{icon} {name}: {latency}ms · {msg} · 拉到 {n} 个模型")
+            self.set_status(f"{icon} {name}: {latency}ms · {msg} · 拉到 {n} 个模型", "ok")
             if model_infos:
                 # 弹窗展示模型列表，并可一键导入到表格
                 self._show_discovered_models(name, model_infos, latency)
         else:
-            self.status.setText(f"{icon} {name}: {latency}ms · {msg}")
+            self.set_status(f"{icon} {name}: {latency}ms · {msg}", "err")
 
     def _show_discovered_models(self, name, model_infos, latency):
         """展示测速发现的模型（含能力信息），支持勾选导入到当前 provider。
@@ -2152,7 +2557,7 @@ class MainWindow(QtWidgets.QMainWindow):
             existing_ids.add(mid)
             imported += 1
         if imported:
-            self.status.setText(f"已导入 {imported} 个模型（含自动识别能力与视觉插件），记得点保存")
+            self.set_status(f"已导入 {imported} 个模型（含自动识别能力与视觉插件），记得点保存", "ok")
 
     def _collect_vision_candidates(self):
         """收集所有支持图像的模型作为视觉插件候选。返回 [(label, vision_str)]。"""
@@ -2185,7 +2590,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _probe_selected_models(self, name, tbl, model_infos):
         """对勾选的模型逐个发带图片的最小请求，探测是否支持图片。
-        在弹窗内同步探测并直接更新表格（modal 弹窗无法用异步回调更新）。"""
+        异步探测：通过 QThread + pyqtSignal 逐个更新表格，避免阻塞 UI。"""
         base_url = self.ed_baseurl.text().strip()
         key = self.ed_apikey.text().strip()
         if not base_url:
@@ -2203,43 +2608,59 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "提示", "请先勾选要探测的模型")
             return
 
-        self.status.setText(f"正在探测 {len(selected)} 个模型的能力...")
-        # 逐个探测，同步更新表格
-        for r, mid in selected:
+        self.set_status(f"正在探测 {len(selected)} 个模型的能力...", "info")
+        # 标记所有待探测行
+        for r, _mid in selected:
             img_item = tbl.item(r, 2)
-            ctx_item = tbl.item(r, 3)
             if img_item:
                 img_item.setText("⏳ 探测中...")
-            QtWidgets.QApplication.processEvents()
-            ok, supports, msg = probe_model_capability(base_url, key, mid)
-            if img_item:
-                img_item.setText("🖼 支持" if supports else "仅文本")
-            # 上下文：先查已知对照表，再回退到端点已返回的值
-            ctx_lookup = lookup_context_window(mid)
-            ctx_from_endpoint = None
-            for mi in model_infos:
+
+        # 异步探测 worker
+        self._probe_worker = ProbeModelsWorker(base_url, key, selected)
+        self._probe_tbl = tbl
+        self._probe_model_infos = model_infos
+        self._probe_selected = selected
+        self._probe_worker.result_ready.connect(self._on_probe_result)
+        self._probe_worker.finished.connect(self._on_probe_finished)
+        self._probe_worker.start()
+
+    @QtCore.pyqtSlot(int, str, bool, bool, str)
+    def _on_probe_result(self, row, mid, ok, supports, msg):
+        """单个模型探测完成，更新表格。"""
+        tbl = self._probe_tbl
+        img_item = tbl.item(row, 2)
+        if img_item:
+            img_item.setText("🖼 支持" if supports else "仅文本")
+        # 上下文：先查已知对照表，再回退到端点已返回的值
+        ctx_lookup = lookup_context_window(mid)
+        ctx_from_endpoint = None
+        for mi in self._probe_model_infos:
+            if mi.get("id") == mid:
+                mi["input"] = ["text", "image"] if supports else ["text"]
+                ctx_from_endpoint = mi.get("contextWindow")
+                break
+        ctx_final = ctx_lookup or ctx_from_endpoint
+        ctx_item = tbl.item(row, 3)
+        if ctx_final:
+            if ctx_item:
+                ctx_item.setText(str(ctx_final))
+            # 同步写入 model_infos
+            for mi in self._probe_model_infos:
                 if mi.get("id") == mid:
-                    mi["input"] = ["text", "image"] if supports else ["text"]
-                    ctx_from_endpoint = mi.get("contextWindow")
+                    mi["contextWindow"] = ctx_final
                     break
-            ctx_final = ctx_lookup or ctx_from_endpoint
-            if ctx_final:
-                if ctx_item:
-                    ctx_item.setText(str(ctx_final))
-                # 同步写入 model_infos
-                for mi in model_infos:
-                    if mi.get("id") == mid:
-                        mi["contextWindow"] = ctx_final
-                        break
-            else:
-                if ctx_item:
-                    ctx_item.setText("未知")
-            self.status.setText(
-                f"{mid}: {'支持图片' if supports else '不支持图片'} · "
-                f"上下文 {ctx_final if ctx_final else '未知'} ({msg})"
-            )
-            QtWidgets.QApplication.processEvents()
-        self.status.setText(f"探测完成：{len(selected)} 个模型")
+        else:
+            if ctx_item:
+                ctx_item.setText("未知")
+        self.set_status(
+            f"{mid}: {'支持图片' if supports else '不支持图片'} · "
+            f"上下文 {ctx_final if ctx_final else '未知'} ({msg})",
+            "ok" if supports else "warn",
+        )
+
+    @QtCore.pyqtSlot()
+    def _on_probe_finished(self):
+        self.set_status(f"探测完成：{len(self._probe_selected)} 个模型", "ok")
 
     def current_name(self):
         item = self.list_widget.currentItem()
@@ -2333,7 +2754,8 @@ def main():
     bridge_status = install_vision_bridge()
     store = ConfigStore()
     window = MainWindow(store)
-    window.status.setText(bridge_status)
+    level = "ok" if "已" in bridge_status else "info"
+    window.set_status(bridge_status, level)
 
     # 系统托盘
     tray = TrayApp(icon, window, store)
