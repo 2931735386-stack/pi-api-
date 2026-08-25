@@ -161,7 +161,7 @@ class SitesTab(QtWidgets.QWidget):
         self.reload()
 
     def _on_test_all(self):
-        from app import TestEndpointWorker
+        from netprobe import TestEndpointWorker
         sites = self._sites()
         if not sites:
             return
