@@ -1,0 +1,19 @@
+{
+  "name": "pi-api-switcher-cache-guard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fail-closed prompt-cache compatibility guard managed by pi API Switcher.",
+  "keywords": [
+    "pi-package",
+    "prompt-cache",
+    "openai-compatible"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

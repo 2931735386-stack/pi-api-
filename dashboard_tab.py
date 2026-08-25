@@ -39,6 +39,13 @@ class ModernDashboardTab(QtWidgets.QWidget):
         super().__init__(parent)
         self.setObjectName("dashboardTab")
         self.current_filter = "year"
+        self.worker = None
+        self._reload_pending = False
+        self._loading = False
+        self._shimmer_cards = ()
+        self._shimmer_timer = QtCore.QTimer(self)
+        self._shimmer_timer.setInterval(33)
+        self._shimmer_timer.timeout.connect(self._advance_shimmers)
         self._build_ui()
         self._setup_auto_watcher()
         self.load_data()
@@ -136,6 +143,11 @@ class ModernDashboardTab(QtWidgets.QWidget):
         filter_bar.addWidget(sec_title)
 
         filter_bar.addStretch(1)
+
+        self.lbl_vision_summary = QtWidgets.QLabel("视觉: 0 调用 · 0 缓存")
+        self.lbl_vision_summary.setObjectName("dateRangeLabel")
+        self.lbl_vision_summary.setToolTip("Vision Bridge 嵌套调用、会话缓存命中与平均延迟")
+        filter_bar.addWidget(self.lbl_vision_summary)
 
         self.lbl_date_range = QtWidgets.QLabel("00/00 00:00 - 00/00 00:00")
         self.lbl_date_range.setObjectName("dateRangeLabel")
@@ -295,25 +307,74 @@ class ModernDashboardTab(QtWidgets.QWidget):
         self.load_data()
 
     def load_data(self):
+        # 合并刷新请求：目录监听、手动刷新和筛选切换不会堆积后台线程。
+        if self.worker is not None and self.worker.isRunning():
+            self._reload_pending = True
+            return
+
+        self._reload_pending = False
+        self._loading = True
         self.btn_refresh.setEnabled(False)
-        # U-11：加载期间显示占位状态（骨架屏），避免显示旧数据或 0
+        loading_cards = (self.card_daily, self.card_requests, self.card_tokens,
+                         self.card_rpm, self.card_tpm, self.card_cache, self.card_cost)
+        self._shimmer_cards = loading_cards
+        self.card_daily.start_shimmer()
         self.card_daily.val_req.setText("—")
         self.card_daily.val_tok.setText("—")
         self.card_daily.val_cost.setText("—")
-        for _card in (self.card_requests, self.card_tokens, self.card_rpm,
-                      self.card_tpm, self.card_cache, self.card_cost):
+        for _card in loading_cards[1:]:
+            _card.start_shimmer()
             _card.lbl_value.setText("—")
             _card.lbl_sub.setText("加载中...")
             _card.spark.set_data([])
+        # 每次加载只保留一个动画定时器，减少多个卡片定时器同时唤醒主线程。
+        for _card in loading_cards:
+            timer = getattr(_card, "_shimmer_timer", None)
+            if timer is not None and timer.isActive():
+                timer.stop()
+        if not self._shimmer_timer.isActive():
+            self._shimmer_timer.start()
         self.lbl_date_range.setText("加载中...")
+        self.lbl_vision_summary.setText("视觉: 加载中...")
         self.lbl_model_count.setText("—")
         self.lbl_token_badge_val.setText("—")
         self.lbl_token_badge_sub.setText("加载中...")
         self.lbl_health_badge_val.setText("—")
         self.lbl_health_badge_sub.setText("加载中...")
-        self.worker = DataLoadWorker(filter_mode=self.current_filter)
-        self.worker.loaded.connect(self._on_data_loaded)
-        self.worker.start()
+        worker = DataLoadWorker(filter_mode=self.current_filter, parent=self)
+        self.worker = worker
+        worker.loaded.connect(
+            lambda data, source=worker: self._on_data_loaded(data, source)
+        )
+        worker.finished.connect(
+            lambda source=worker: self._on_worker_finished(source)
+        )
+        worker.start()
+
+    def _advance_shimmers(self):
+        for card in self._shimmer_cards:
+            if getattr(card, "_shimmering", False):
+                card._on_shimmer_step()
+
+    def _on_worker_finished(self, worker):
+        # 旧线程的 queued finished 信号不能清理当前正在运行的新线程。
+        if worker is not self.worker:
+            worker.deleteLater()
+            return
+        self.worker = None
+        self._loading = False
+        self._shimmer_timer.stop()
+        for card in self._shimmer_cards:
+            card.stop_shimmer()
+        self._shimmer_cards = ()
+        if worker is not None:
+            worker.deleteLater()
+
+        if self._reload_pending:
+            self._reload_pending = False
+            QtCore.QTimer.singleShot(0, self.load_data)
+        else:
+            self.btn_refresh.setEnabled(True)
 
     def _apply_theme_to_children(self, c):
         """传递主题调色板至所有看板子组件。"""
@@ -323,9 +384,18 @@ class ModernDashboardTab(QtWidgets.QWidget):
         self.legend_health.set_theme_colors(c)
         self.model_list_widget.set_theme_colors(c)
 
-    def _on_data_loaded(self, data):
-        self.btn_refresh.setEnabled(True)
+    def _on_data_loaded(self, data, worker=None):
+        if worker is not None and worker is not self.worker:
+            return
+        # 批量更新看板控件，避免每个 QLabel/图表更新都触发一次重绘。
+        self.setUpdatesEnabled(False)
+        try:
+            self._apply_data_loaded(data)
+        finally:
+            self.setUpdatesEnabled(True)
+            self.update()
 
+    def _apply_data_loaded(self, data):
         fmt = analytics.format_number_compact
 
         # 1. 每日平均 (Card 1)
@@ -387,8 +457,22 @@ class ModernDashboardTab(QtWidgets.QWidget):
             spark_data=data.get("daily_trend_tokens", [])[-14:]
         )
 
-        # Filter Bar Date Range
+        # Filter Bar Date Range + Vision Bridge nested-call telemetry
         self.lbl_date_range.setText(data.get("date_range_str", ""))
+        vision_calls = data.get("vision_calls", 0)
+        vision_hits = data.get("vision_cache_hits", 0)
+        vision_failures = data.get("vision_failures", 0)
+        vision_latency = data.get("vision_avg_latency_ms", 0.0)
+        self.lbl_vision_summary.setText(
+            f"视觉: {vision_calls} 调用 · {vision_hits} 缓存 · {vision_latency:.0f}ms"
+        )
+        self.lbl_vision_summary.setToolTip(
+            f"成功: {data.get('vision_success', 0)}\n"
+            f"失败/回退: {vision_failures}\n"
+            f"会话缓存命中: {vision_hits}\n"
+            f"处理图片: {data.get('vision_image_count', 0)} 张\n"
+            f"图片数据: {analytics.format_number_compact(data.get('vision_image_bytes', 0))}B"
+        )
 
         # Bottom Left: Model List
         models_dict = data.get("models", {})
@@ -405,3 +489,14 @@ class ModernDashboardTab(QtWidgets.QWidget):
         self.lbl_health_badge_val.setText(f"{rate:.1f}%")
         self.lbl_health_badge_sub.setText(f"● 成功 {succ_calls}  ■ 失败 {fail_calls}")
         self.heatmap_health.set_data(data.get("heatmap_health", []))
+
+    def closeEvent(self, event):
+        """关闭看板前回收分析线程，避免 Qt 销毁运行中的 QThread。"""
+        debounce_timer = getattr(self, "_debounce_timer", None)
+        if debounce_timer is not None and debounce_timer.isActive():
+            debounce_timer.stop()
+        if self._shimmer_timer.isActive():
+            self._shimmer_timer.stop()
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.wait(2000)
+        super().closeEvent(event)

@@ -185,20 +185,61 @@ class DailyAvgCardWidget(QtWidgets.QFrame):
 
         layout.addStretch(1)
 
+    def start_shimmer(self):
+        """开启骨架屏扫光动效。"""
+        self._shimmering = True
+        self._shimmer_phase = 0.0
+        if not hasattr(self, "_shimmer_timer") or self._shimmer_timer is None:
+            self._shimmer_timer = QtCore.QTimer(self)
+            self._shimmer_timer.setInterval(33)
+            self._shimmer_timer.timeout.connect(self._on_shimmer_step)
+        if not self._shimmer_timer.isActive():
+            self._shimmer_timer.start()
+        self.update()
+
+    def stop_shimmer(self):
+        """停止骨架屏扫光动效。"""
+        self._shimmering = False
+        if hasattr(self, "_shimmer_timer") and self._shimmer_timer and self._shimmer_timer.isActive():
+            self._shimmer_timer.stop()
+        self.update()
+
+    def _on_shimmer_step(self):
+        self._shimmer_phase = (self._shimmer_phase + 0.04) % 1.0
+        self.update()
+
     def update_data(self, days_span, avg_calls, avg_tokens_str, avg_cost):
+        self.stop_shimmer()
         self.lbl_range.setText(f"范围 {days_span} 天")
         self.val_req.setText(f"{avg_calls:.1f}")
         self.val_tok.setText(avg_tokens_str)
         self.val_cost.setText(f"${avg_cost:.4f}")
 
     def paintEvent(self, event):
-        """先绘制默认背景，再在顶部绘制 3px 强调色横条。"""
+        """先绘制默认背景，再绘制 Shimmer 扫光（如果激活）及顶部 3px 强调色横条。"""
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
+        # 骨架屏扫光动效
+        if getattr(self, "_shimmering", False):
+            w = float(self.width())
+            h = float(self.height())
+            band_w = w * 0.6
+            center_x = (self._shimmer_phase * (w + band_w * 2)) - band_w
+            grad = QLinearGradient(center_x - band_w / 2, 0, center_x + band_w / 2, 0)
+            c_transparent = QColor(255, 255, 255, 0)
+            c_glow = QColor(255, 255, 255, 28)
+            grad.setColorAt(0.0, c_transparent)
+            grad.setColorAt(0.5, c_glow)
+            grad.setColorAt(1.0, c_transparent)
+            painter.setBrush(QBrush(grad))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 8, 8)
+
+        # 顶部 3px 强调色横条，与圆角对齐
         painter.setBrush(QBrush(self._accent_strip))
         painter.setPen(Qt.NoPen)
-        # 顶部 3px 强调色横条，与圆角对齐
         painter.drawRoundedRect(QRectF(0, 0, self.width(), 3), 2, 2)
 
 
@@ -208,6 +249,8 @@ class StandardCardWidget(QtWidgets.QFrame):
     def __init__(self, title, icon_char="⚡", accent_color="#3b82f6", parent=None):
         super().__init__(parent)
         self.accent_color = accent_color
+        self._shimmering = False
+        self._shimmer_phase = 0.0
         self.setObjectName("kpiCard")
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
 
@@ -254,17 +297,59 @@ class StandardCardWidget(QtWidgets.QFrame):
         self.spark = SparklineWidget(color=accent_color, parent=self)
         layout.addWidget(self.spark)
 
+    def start_shimmer(self):
+        """开启骨架屏扫光动效。"""
+        self._shimmering = True
+        self._shimmer_phase = 0.0
+        if not hasattr(self, "_shimmer_timer") or self._shimmer_timer is None:
+            self._shimmer_timer = QtCore.QTimer(self)
+            self._shimmer_timer.setInterval(33)
+            self._shimmer_timer.timeout.connect(self._on_shimmer_step)
+        if not self._shimmer_timer.isActive():
+            self._shimmer_timer.start()
+        self.update()
+
+    def stop_shimmer(self):
+        """停止骨架屏扫光动效。"""
+        self._shimmering = False
+        if hasattr(self, "_shimmer_timer") and self._shimmer_timer and self._shimmer_timer.isActive():
+            self._shimmer_timer.stop()
+        self.update()
+
+    def _on_shimmer_step(self):
+        self._shimmer_phase = (self._shimmer_phase + 0.04) % 1.0
+        self.update()
+
     def update_data(self, value_str, sub_info="", spark_data=None):
+        self.stop_shimmer()
         self.lbl_value.setText(value_str)
         self.lbl_sub.setText(sub_info)
         if spark_data is not None:
             self.spark.set_data(spark_data, self.accent_color)
 
     def paintEvent(self, event):
-        """先绘制默认背景，再在顶部绘制 3px 强调色横条。"""
+        """先绘制默认背景，再绘制 Shimmer 扫光（若激活）与顶部 3px 强调色横条。"""
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
+        # 骨架屏扫光动效
+        if getattr(self, "_shimmering", False):
+            w = float(self.width())
+            h = float(self.height())
+            band_w = w * 0.6
+            center_x = (self._shimmer_phase * (w + band_w * 2)) - band_w
+            grad = QLinearGradient(center_x - band_w / 2, 0, center_x + band_w / 2, 0)
+            c_transparent = QColor(255, 255, 255, 0)
+            c_glow = QColor(255, 255, 255, 28)
+            grad.setColorAt(0.0, c_transparent)
+            grad.setColorAt(0.5, c_glow)
+            grad.setColorAt(1.0, c_transparent)
+            painter.setBrush(QBrush(grad))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 8, 8)
+
+        # 顶部 3px 强调色横条
         painter.setBrush(QBrush(QColor(self.accent_color)))
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(QRectF(0, 0, self.width(), 3), 2, 2)

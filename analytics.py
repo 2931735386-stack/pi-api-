@@ -50,7 +50,15 @@ def _load_all_records(sessions_dir):
     """
     jsonl_files = list(sessions_dir.glob("**/*.jsonl"))
     # 检查缓存是否可复用：文件集合与 mtime 未变
-    current_sig = {str(f): f.stat().st_mtime for f in jsonl_files if f.exists()}
+    # mtime 的浮点秒精度不足以覆盖快速连续写入；同时记录纳秒时间和大小，
+    # 避免日志在短时间内更新时误用旧解析结果。
+    current_sig = {}
+    for f in jsonl_files:
+        try:
+            stat = f.stat()
+        except OSError:
+            continue
+        current_sig[str(f)] = (stat.st_mtime_ns, stat.st_size)
     cache = _RAW_RECORDS_CACHE.get(str(sessions_dir))
     if cache and cache["sig"] == current_sig:
         return cache["records"]
@@ -67,6 +75,46 @@ def _load_all_records(sessions_dir):
                         data = json.loads(line)
                     except Exception:
                         continue
+                    # Vision Bridge writes custom entries that do not enter LLM context.
+                    # Input-hook nested usage is otherwise invisible to Pi; tool-result
+                    # nested usage is already returned through Pi and is not added twice.
+                    if data.get("type") == "custom" and data.get("customType") == "vision-bridge-usage-v1":
+                        event = data.get("data")
+                        if not isinstance(event, dict):
+                            continue
+                        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+                        include = bool(event.get("includeInTotals"))
+                        inp = (usage.get("input", 0) or 0) if include else 0
+                        out = (usage.get("output", 0) or 0) if include else 0
+                        cr = (usage.get("cacheRead", 0) or 0) if include else 0
+                        cw = (usage.get("cacheWrite", 0) or 0) if include else 0
+                        rea = (usage.get("reasoning", 0) or 0) if include else 0
+                        total = (usage.get("totalTokens", inp + out) or (inp + out)) if include else 0
+                        ts = event.get("timestamp") or data.get("timestamp")
+                        epoch_s = _timestamp_to_epoch(ts)
+                        vision_provider = event.get("visionProvider") or "unknown"
+                        vision_model = event.get("visionModel") or "unknown"
+                        records.append({
+                            "kind": "vision",
+                            "model": f"vision:{vision_provider}/{vision_model}",
+                            "epoch_s": epoch_s,
+                            "is_fail": event.get("status") == "failure",
+                            "input": inp,
+                            "output": out,
+                            "cacheRead": cr,
+                            "cacheWrite": cw,
+                            "reasoning": rea,
+                            "total": total,
+                            "include_in_totals": include,
+                            "vision_status": event.get("status", "unknown"),
+                            "vision_cached": bool(event.get("cached")),
+                            "vision_requested": bool(event.get("requested")),
+                            "vision_latency_ms": event.get("latencyMs", 0) or 0,
+                            "vision_image_bytes": event.get("imageBytes", 0) or 0,
+                            "vision_image_count": event.get("imageCount", 0) or 0,
+                        })
+                        continue
+
                     msg = data.get("message", {})
                     if not isinstance(msg, dict):
                         continue
@@ -76,16 +124,7 @@ def _load_all_records(sessions_dir):
 
                     model = msg.get("model") or msg.get("responseModel") or data.get("model") or "unknown"
                     ts = msg.get("timestamp") or data.get("timestamp")
-                    epoch_s = 0.0
-                    if ts:
-                        if isinstance(ts, (int, float)):
-                            epoch_s = ts / 1000.0 if ts > 1e11 else float(ts)
-                        elif isinstance(ts, str):
-                            try:
-                                dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                                epoch_s = dt.timestamp()
-                            except Exception:
-                                pass
+                    epoch_s = _timestamp_to_epoch(ts)
 
                     stop_reason = msg.get("stopReason", "")
                     is_fail = stop_reason in ["error", "abort"] or "error" in data
@@ -97,6 +136,7 @@ def _load_all_records(sessions_dir):
                     tot = u.get("totalTokens", inp + out) or (inp + out)
 
                     records.append({
+                        "kind": "model",
                         "model": model,
                         "epoch_s": epoch_s,
                         "is_fail": is_fail,
@@ -106,6 +146,7 @@ def _load_all_records(sessions_dir):
                         "cacheWrite": cw,
                         "reasoning": rea,
                         "total": tot,
+                        "include_in_totals": True,
                     })
         except Exception:
             continue
@@ -116,6 +157,17 @@ def _load_all_records(sessions_dir):
 
 # 原始记录缓存：{目录路径: {"sig": {文件路径: mtime}, "records": [...]}}
 _RAW_RECORDS_CACHE = {}
+
+
+def _timestamp_to_epoch(value):
+    if isinstance(value, (int, float)):
+        return value / 1000.0 if value > 1e11 else float(value)
+    if isinstance(value, str) and value:
+        try:
+            return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError):
+            return 0.0
+    return 0.0
 
 
 def parse_session_records(sessions_dir=None, filter_mode="year"):
@@ -150,11 +202,19 @@ def parse_session_records(sessions_dir=None, filter_mode="year"):
     total_cache_read = 0
     total_cache_write = 0
     total_reasoning = 0
+    vision_calls = 0
+    vision_success = 0
+    vision_failures = 0
+    vision_cache_hits = 0
+    vision_latency_ms = 0
+    vision_image_bytes = 0
+    vision_image_count = 0
 
     daily_map = defaultdict(lambda: {
         "calls": 0, "tokens": 0, "input": 0, "output": 0,
         "cacheRead": 0, "cacheWrite": 0, "reasoning": 0,
-        "success": 0, "fail": 0
+        "success": 0, "fail": 0,
+        "visionCalls": 0, "visionCacheHits": 0
     })
     model_map = defaultdict(lambda: {
         "calls": 0, "input": 0, "output": 0,
@@ -173,6 +233,37 @@ def parse_session_records(sessions_dir=None, filter_mode="year"):
 
         model = rec["model"]
         is_fail = rec["is_fail"]
+        is_vision = rec.get("kind") == "vision"
+        if is_vision:
+            status = rec.get("vision_status")
+            if rec.get("vision_requested"):
+                vision_calls += 1
+                vision_latency_ms += rec.get("vision_latency_ms", 0) or 0
+            if status == "success":
+                vision_success += 1
+            elif status == "failure":
+                vision_failures += 1
+            elif status == "cache_hit":
+                vision_cache_hits += 1
+            # Candidate fallback can emit multiple failure/skipped diagnostics
+            # for one user image. Count image volume only for the final success
+            # or a session-cache reuse, so dashboard totals are not multiplied.
+            if status in ("success", "cache_hit"):
+                vision_image_bytes += rec.get("vision_image_bytes", 0) or 0
+                vision_image_count += rec.get("vision_image_count", 0) or 0
+
+        # Tool-result usage is already included by Pi. Cache reuse and skipped
+        # candidates carry no provider request usage. Keep their diagnostic
+        # counters without double-counting requests/tokens/cost.
+        if not rec.get("include_in_totals", True):
+            if epoch_s > 0:
+                dstr = datetime.datetime.fromtimestamp(epoch_s).strftime("%Y-%m-%d")
+                if rec.get("vision_requested"):
+                    daily_map[dstr]["visionCalls"] += 1
+                if rec.get("vision_cached"):
+                    daily_map[dstr]["visionCacheHits"] += 1
+            continue
+
         inp = rec["input"]
         out = rec["output"]
         cr = rec["cacheRead"]
@@ -221,6 +312,10 @@ def parse_session_records(sessions_dir=None, filter_mode="year"):
                 daily_map[dstr]["fail"] += 1
             else:
                 daily_map[dstr]["success"] += 1
+            if is_vision and rec.get("vision_requested"):
+                daily_map[dstr]["visionCalls"] += 1
+            if is_vision and rec.get("vision_cached"):
+                daily_map[dstr]["visionCacheHits"] += 1
 
     # 日期范围
     if timestamps:
@@ -257,7 +352,8 @@ def parse_session_records(sessions_dir=None, filter_mode="year"):
         dinfo = daily_map.get(curr_str, {
             "calls": 0, "tokens": 0, "input": 0, "output": 0,
             "cacheRead": 0, "cacheWrite": 0, "reasoning": 0,
-            "success": 0, "fail": 0
+            "success": 0, "fail": 0,
+            "visionCalls": 0, "visionCacheHits": 0
         })
         
         heatmap_tokens.append({
@@ -337,6 +433,13 @@ def parse_session_records(sessions_dir=None, filter_mode="year"):
         "daily_trend_tokens": daily_trend_tokens,
         "daily_trend_calls": daily_trend_calls,
         "daily_trend_cache": daily_trend_cache,
+        "vision_calls": vision_calls,
+        "vision_success": vision_success,
+        "vision_failures": vision_failures,
+        "vision_cache_hits": vision_cache_hits,
+        "vision_avg_latency_ms": (vision_latency_ms / vision_calls) if vision_calls > 0 else 0.0,
+        "vision_image_bytes": vision_image_bytes,
+        "vision_image_count": vision_image_count,
     }
 
 
@@ -350,6 +453,9 @@ def _empty_result():
         "avg_calls": 0.0, "avg_tokens": 0.0, "avg_cost": 0.0,
         "models": {}, "days": {}, "heatmap_tokens": [], "heatmap_health": [],
         "daily_trend_tokens": [], "daily_trend_calls": [], "daily_trend_cache": [],
+        "vision_calls": 0, "vision_success": 0, "vision_failures": 0,
+        "vision_cache_hits": 0, "vision_avg_latency_ms": 0.0,
+        "vision_image_bytes": 0, "vision_image_count": 0,
     }
 
 

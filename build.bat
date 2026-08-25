@@ -16,7 +16,11 @@ echo [2/3] 生成图标（若不存在）...
 python -c "from pathlib import Path; import sys; sys.path.insert(0,'.'); from app import generate_icon_ico; generate_icon_ico(Path('icon.ico')); print('icon.ico ready')"
 
 echo [3/3] 打包为 exe ...
-python -m PyInstaller --noconsole --onefile --name "pi-api-switcher" --icon=icon.ico --add-data "vision-bridge.ts;." app.py
+python -m PyInstaller --clean --noconfirm pi-api-switcher.spec
+if errorlevel 1 (
+    echo 打包失败，请查看上方错误。
+    exit /b 1
+)
 
 echo.
 echo 打包完成！输出在 dist\pi-api-switcher.exe

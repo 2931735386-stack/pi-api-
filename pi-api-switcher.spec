@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('vision-bridge.ts', '.')],
+    datas=[('vision-bridge.ts', '.'), ('cache-compat-guard', 'cache-compat-guard')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -36,4 +36,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['icon.ico'],
+    version='version_info.txt',
 )

@@ -1,6 +1,9 @@
 import ast, sys
 
-files = ['app.py', 'analytics.py', 'dashboard_widgets.py', 'dashboard_tab.py']
+files = [
+    'app.py', 'analytics.py', 'cache_compat.py', 'vision_config.py',
+    'dashboard_widgets.py', 'dashboard_tab.py', 'extensions_tab.py'
+]
 ok = True
 for f in files:
     try:

@@ -21,15 +21,49 @@ pi-api-switcher — CC Switch 风格的 pi API/模型配置桌面管理器
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+from copy import deepcopy
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QPoint, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal, QLockFile
+from PyQt5.QtWidgets import QShortcut
+from PyQt5.QtGui import QKeySequence
 from dashboard_tab import ModernDashboardTab
+from extensions_tab import SkillsExtensionsTab
+from sites_tab import SitesTab
+from cache_compat import (
+    CACHE_POLICY_OPTIONS,
+    apply_provider_cache_compat,
+    disable_optimizer_cache_key_fallback,
+    install_cache_guard,
+    load_guard_config,
+    normalize_cache_policy,
+    provider_cache_policy,
+    remove_provider_cache_policy,
+    rename_provider_cache_policy,
+    save_guard_config,
+    set_provider_cache_policy,
+)
+from vision_config import (
+    VISION_MODE_OPTIONS,
+    candidates_to_legacy,
+    effective_vision_route,
+    load_vision_config,
+    migrate_legacy_vision_routes,
+    normalize_candidates,
+    normalize_vision_mode,
+    rename_provider_vision_routes,
+    remove_provider_vision_routes,
+    remove_vision_route,
+    save_vision_config,
+    set_vision_route,
+)
 
 
 # =============================================================================
@@ -43,7 +77,19 @@ SETTINGS_PATH = AGENT_DIR / "settings.json"
 
 # 应用自身配置（保存主题/字体选择）
 APP_CONFIG_PATH = AGENT_DIR / "api-switcher.json"
+CACHE_GUARD_CONFIG_PATH = AGENT_DIR / "cache-compat-guard.json"
+VISION_CONFIG_PATH = AGENT_DIR / "vision-bridge.json"
 VISION_BRIDGE_NAME = "vision-bridge.ts"
+
+
+def _atomic_write_text_file(path: Path, text: str) -> None:
+    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        temp.write_text(text, encoding="utf-8")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def install_vision_bridge() -> str:
@@ -67,9 +113,9 @@ def install_vision_bridge() -> str:
                 return "视觉桥接扩展已就绪"
             if not target_text.startswith("// Managed by pi-api-switcher."):
                 return "已保留用户自定义视觉桥接扩展"
-            target.write_text(source_text, encoding="utf-8")
+            _atomic_write_text_file(target, source_text)
             return "已更新视觉桥接扩展"
-        target.write_text(source_text, encoding="utf-8")
+        _atomic_write_text_file(target, source_text)
         return "已安装视觉桥接扩展"
     except OSError as exc:
         return f"视觉桥接扩展安装失败：{exc}"
@@ -250,6 +296,45 @@ def build_thinking_map(max_level: str) -> dict:
     return m
 
 
+def merge_model_edits(stored_models, edited_models):
+    """Merge table-managed fields while preserving advanced model metadata."""
+    stored_by_id = {
+        model.get("id"): model
+        for model in stored_models
+        if isinstance(model, dict) and model.get("id")
+    }
+    merged_models = []
+    for edited in edited_models:
+        model_id = edited.get("id")
+        stored = stored_by_id.get(model_id, {})
+        merged = dict(stored)
+        merged.update(edited)
+        # Preserve provider-specific explicit off values such as "none". The
+        # generic table editor only controls the maximum level and otherwise
+        # emits off=null, which would make Pi clamp `off` to `minimal`.
+        stored_map = stored.get("thinkingLevelMap") if isinstance(stored, dict) else None
+        edited_map = edited.get("thinkingLevelMap")
+        if isinstance(stored_map, dict) and isinstance(edited_map, dict):
+            protected_map = dict(edited_map)
+            # Preserve every explicit capability hole. The table edits only the
+            # highest level and cannot safely infer that a provider gained an
+            # intermediate level such as `minimal`.
+            for level, stored_value in stored_map.items():
+                if stored_value is None and protected_map.get(level) is not None:
+                    protected_map[level] = None
+            if isinstance(stored_map.get("off"), str) and protected_map.get("off") is None:
+                protected_map["off"] = stored_map["off"]
+            merged["thinkingLevelMap"] = protected_map
+        if "thinkingLevelMap" not in edited:
+            merged.pop("thinkingLevelMap", None)
+        if "visionModel" not in edited:
+            merged.pop("visionModel", None)
+        if "visionMode" not in edited:
+            merged.pop("visionMode", None)
+        merged_models.append(merged)
+    return merged_models
+
+
 def validate_baseurl(url: str) -> bool:
     """校验 baseUrl 格式：必须以 http:// 或 https:// 开头。"""
     return re.match(r"^https?://", url.strip()) is not None
@@ -266,21 +351,45 @@ def read_json(path: Path):
 
 def write_json(path: Path, data) -> bool:
     """原子写入：先写临时文件再替换，防止写入中断导致数据损坏。"""
-    tmp_path = path.with_suffix(".tmp")
     try:
-        tmp_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        _atomic_write_text_file(
+            path, json.dumps(data, ensure_ascii=False, indent=2) + "\n"
         )
-        tmp_path.replace(path)  # 原子替换
         return True
-    except (OSError, ValueError, json.JSONDecodeError):
-        tmp_path.unlink(missing_ok=True)
+    except (OSError, ValueError):
         return False
 
 
 # =============================================================================
 # 数据模型
 # =============================================================================
+
+# 快照目录：每次保存前备份 5 个配置文件，保留最近 SNAPSHOTS_KEEP 份
+SNAPSHOTS_DIR = AGENT_DIR / "backups"
+SNAPSHOTS_KEEP = 20
+SNAPSHOT_FILES = ("models.json", "auth.json", "settings.json",
+                  "cache-compat-guard.json", "vision-bridge.json")
+
+
+def snapshot_configs():
+    """把当前配置复制到 backups/<时间戳>/；失败静默（备份不应阻塞保存）。"""
+    try:
+        existing = [f for f in SNAPSHOT_FILES if (AGENT_DIR / f).exists()]
+        if not existing:
+            return
+        dest = SNAPSHOTS_DIR / time.strftime("%Y%m%d-%H%M%S")
+        dest.mkdir(parents=True, exist_ok=True)
+        for name in existing:
+            shutil.copy2(AGENT_DIR / name, dest / name)
+        # 只保留最近 N 份（仅限本工具生成的 <时间戳> 格式目录，不动其他来源的备份）
+        pat = re.compile(r"^\d{8}-\d{6}$")
+        snaps = sorted(d for d in SNAPSHOTS_DIR.iterdir()
+                       if d.is_dir() and pat.match(d.name))
+        for old in snaps[:-SNAPSHOTS_KEEP]:
+            shutil.rmtree(old, ignore_errors=True)
+    except OSError:
+        pass
+
 
 class ConfigStore:
     """封装对三个 JSON 文件的读写。"""
@@ -292,6 +401,38 @@ class ConfigStore:
         self.models = read_json(MODELS_PATH)
         self.auth = read_json(AUTH_PATH)
         self.settings = read_json(SETTINGS_PATH)
+        self.cache_guard = load_guard_config(CACHE_GUARD_CONFIG_PATH)
+        self.vision = load_vision_config(VISION_CONFIG_PATH)
+        if migrate_legacy_vision_routes(self.models, self.vision):
+            save_vision_config(VISION_CONFIG_PATH, self.vision)
+        self._clean_stale_enabled_models()
+
+    def _clean_stale_enabled_models(self):
+        """Remove obsolete `*-request` aliases when the canonical model exists."""
+        enabled = self.settings.get("enabledModels")
+        if not isinstance(enabled, list):
+            return
+        configured = {
+            model.get("id")
+            for provider in self.models.get("providers", {}).values()
+            if isinstance(provider, dict)
+            for model in provider.get("models", [])
+            if isinstance(model, dict) and model.get("id")
+        }
+        cleaned = []
+        for model_id in enabled:
+            if not isinstance(model_id, str):
+                continue
+            if model_id.endswith("-request"):
+                base_id = model_id[:-8]
+                # 兼容 bare ID 或 provider/model 格式的 *-request 清理
+                raw_id = base_id.split("/", 1)[1] if "/" in base_id else base_id
+                if base_id in configured or raw_id in configured:
+                    continue
+            cleaned.append(model_id)
+        if cleaned != enabled:
+            self.settings["enabledModels"] = cleaned
+            write_json(SETTINGS_PATH, self.settings)
 
     def providers(self):
         return self.models.get("providers", {})
@@ -326,10 +467,44 @@ class ConfigStore:
         return self.settings.get("defaultModel", "")
 
     def save(self) -> bool:
+        snapshot_configs()
         ok1 = write_json(MODELS_PATH, self.models)
         ok2 = write_json(AUTH_PATH, self.auth)
         ok3 = write_json(SETTINGS_PATH, self.settings)
-        return ok1 and ok2 and ok3
+        ok4 = save_guard_config(CACHE_GUARD_CONFIG_PATH, self.cache_guard)
+        ok5 = save_vision_config(VISION_CONFIG_PATH, self.vision)
+        return ok1 and ok2 and ok3 and ok4 and ok5
+
+    def cache_policy(self, provider):
+        return provider_cache_policy(self.cache_guard, provider)
+
+    def set_cache_policy(self, provider, policy):
+        set_provider_cache_policy(self.cache_guard, provider, policy)
+
+    def vision_route(self, provider, model):
+        return effective_vision_route(self.vision, provider, model)
+
+    def set_vision_route(self, provider, model_id, mode, candidates):
+        set_vision_route(self.vision, provider, model_id, mode, candidates)
+
+    def remove_vision_route(self, provider, model_id):
+        remove_vision_route(self.vision, provider, model_id)
+
+    def sync_vision_routes(self, provider, models):
+        model_ids = {str(model.get("id", "")) for model in models if model.get("id")}
+        routes = self.vision.get("routes")
+        if isinstance(routes, dict):
+            prefix = f"{provider}/"
+            for key in list(routes):
+                if str(key).startswith(prefix) and str(key)[len(prefix):] not in model_ids:
+                    routes.pop(key, None)
+        for model in models:
+            model_id = str(model.get("id", ""))
+            if not model_id:
+                continue
+            mode = normalize_vision_mode(model.get("visionMode"))
+            candidates = normalize_candidates(model.get("visionModel", ""))
+            self.set_vision_route(provider, model_id, mode, candidates)
 
     def set_default(self, provider, model_id):
         self.settings["defaultProvider"] = provider
@@ -337,15 +512,47 @@ class ConfigStore:
         self.sync_enabled_models(provider)
 
     def sync_enabled_models(self, provider=None):
-        """将 provider 的所有模型 ID 同步到 enabledModels 白名单。
-        这是 pi /model 选择器能显示模型的必要条件。"""
+        """将所有已配置 provider 的模型同步到 enabledModels 白名单。
+        
+        对于同一模型 ID 在多个 provider 中存在的情况（如 glm-5.2 在 glm 与 免费 供应商中均有），
+        自动以 `provider/model`（如 `glm/glm-5.2`、`免费/glm-5.2`）格式写入，
+        确保在 Pi 终端 /model 菜单中能同时展示并带上各自的供应商标注，不会互相覆盖。
+        对于无重名冲突的模型，同时保留其 bare ID 保持最大兼容。
+        """
         enabled = list(self.settings.get("enabledModels", []))
-        if provider:
-            models = self.get_provider(provider).get("models", [])
-            for m in models:
-                mid = m.get("id", "")
-                if mid and mid not in enabled:
+        providers = self.providers()
+        if not isinstance(providers, dict):
+            return
+
+        # 统计每个 model ID 出现的 provider 集合
+        id_to_providers: dict[str, list[str]] = {}
+        for p_name, p_data in providers.items():
+            if not isinstance(p_data, dict):
+                continue
+            for m in p_data.get("models", []):
+                if isinstance(m, dict) and m.get("id"):
+                    mid = str(m["id"]).strip()
+                    if mid:
+                        id_to_providers.setdefault(mid, []).append(str(p_name))
+
+        # 为每个 provider 下的模型构建 scoped 或 bare 格式条目
+        for mid, p_list in id_to_providers.items():
+            if len(p_list) > 1:
+                # 存在同名模型：必须为每个 provider 注入 scoped 标识
+                for p_name in p_list:
+                    scoped = f"{p_name}/{mid}"
+                    if scoped not in enabled:
+                        enabled.append(scoped)
+                # 移除有歧义的裸 ID，避免 Pi /model 出现解析覆盖
+                if mid in enabled:
+                    enabled.remove(mid)
+            else:
+                # 唯一模型：注入 scoped 或 bare（优先保留或添加 bare）
+                p_name = p_list[0]
+                scoped = f"{p_name}/{mid}"
+                if mid not in enabled and scoped not in enabled:
                     enabled.append(mid)
+
         self.settings["enabledModels"] = enabled
 
     def add_provider(self, name, base_url, api_key, model_id, model_name, reasoning):
@@ -368,23 +575,97 @@ class ConfigStore:
         # API Key 统一只写 auth.json，不再内嵌到 models.json
         if api_key:
             self.auth[name] = {"type": "api_key", "key": api_key}
+        self.sync_enabled_models()
+
+    def rename_provider(self, old_name, new_name):
+        """Rename a provider key and migrate all local configuration references."""
+        old_name = str(old_name).strip()
+        new_name = str(new_name).strip()
+        providers = self.models.setdefault("providers", {})
+        if not old_name or old_name not in providers:
+            raise ValueError("供应商不存在")
+        if not new_name:
+            raise ValueError("供应商名称不能为空")
+        if new_name != old_name and new_name in providers:
+            raise ValueError("供应商名称已存在")
+        if new_name == old_name:
+            return False
+
+        provider = providers.pop(old_name)
+        providers[new_name] = provider
+        if old_name in self.auth:
+            self.auth[new_name] = self.auth.pop(old_name)
+        if self.settings.get("defaultProvider") == old_name:
+            self.settings["defaultProvider"] = new_name
+        # 兼容旧版模型字段：部分配置仍直接把候选写在 visionModel 中。
+        old_prefix = f"{old_name}:"
+        for provider in providers.values():
+            for model in provider.get("models", []) if isinstance(provider, dict) else []:
+                if not isinstance(model, dict):
+                    continue
+                legacy = model.get("visionModel")
+                if isinstance(legacy, str):
+                    model["visionModel"] = "|".join(
+                        f"{new_name}:{value[len(old_prefix):]}"
+                        if value.startswith(old_prefix) else value
+                        for value in legacy.split("|")
+                    )
+
+        # 迁移 enabledModels 中的 scoped 条目 (old_name/model -> new_name/model)
+        old_scoped_prefix = f"{old_name}/"
+        enabled = self.settings.get("enabledModels", [])
+        if isinstance(enabled, list):
+            self.settings["enabledModels"] = [
+                f"{new_name}/{m[len(old_scoped_prefix):]}" if isinstance(m, str) and m.startswith(old_scoped_prefix) else m
+                for m in enabled
+            ]
+
+        rename_provider_cache_policy(self.cache_guard, old_name, new_name)
+        rename_provider_vision_routes(self.vision, old_name, new_name)
+        self.sync_enabled_models()
+        return True
 
     def remove_provider(self, name):
-        # 先获取该 provider 的模型 ID 列表（用于清理 enabledModels）
+        # 先获取该 provider 的模型 ID 列表
         p = self.get_provider(name)
-        model_ids = {m.get("id", "") for m in p.get("models", [])}
+        model_ids = {str(m.get("id", "")) for m in p.get("models", []) if m.get("id")}
+        scoped_prefix = f"{name}/"
 
         self.models.get("providers", {}).pop(name, None)
         self.auth.pop(name, None)
+        remove_provider_cache_policy(self.cache_guard, name)
+        remove_provider_vision_routes(self.vision, name)
 
         # 清理 settings.json 中的悬空引用
         if self.settings.get("defaultProvider") == name:
             self.settings["defaultProvider"] = ""
             self.settings["defaultModel"] = ""
-        # 从 enabledModels 中移除属于该 provider 的模型
+
+        # 清理 enabledModels：移除该 provider 的 scoped 条目
         enabled = self.settings.get("enabledModels", [])
-        if model_ids:
-            self.settings["enabledModels"] = [m for m in enabled if m not in model_ids]
+        if isinstance(enabled, list):
+            # 获取剩余其他 provider 依然拥有的模型 ID 集合
+            remaining_ids = {
+                str(m.get("id", ""))
+                for other_p in self.providers().values()
+                if isinstance(other_p, dict)
+                for m in other_p.get("models", [])
+                if isinstance(m, dict) and m.get("id")
+            }
+            # 移除属于该 provider 的 scoped 项；若是裸 ID，仅在其他 provider 都没有时才移除
+            cleaned = []
+            for item in enabled:
+                if not isinstance(item, str):
+                    continue
+                if item.startswith(scoped_prefix):
+                    continue
+                if item in model_ids and item not in remaining_ids:
+                    continue
+                cleaned.append(item)
+            self.settings["enabledModels"] = cleaned
+
+        # 重新同步一次，确保剩余供应商中的同名/唯一模型状态正确
+        self.sync_enabled_models()
 
 
 # =============================================================================
@@ -510,17 +791,6 @@ def probe_model_capability(base_url, api_key, model_id, timeout=8.0):
             return True, True, f"{resp.status} 支持图片（{int(latency)}ms）"
     except urllib.error.HTTPError as e:
         latency = (time.time() - t0) * 1000
-        body = ""
-        try:
-            body = e.read().decode("utf-8", "ignore")
-        except Exception:
-            pass
-        low = body.lower()
-        # 判定是否明确“不支持图片/视觉”
-        unsupported_kw = ["image", "vision", "图片", "图像", "not support", "unsupported",
-                          "does not support", "invalid", "multimodal"]
-        if e.code in (400, 422) and any(k in low for k in unsupported_kw):
-            return True, False, f"{e.code} 不支持图片（{int(latency)}ms）"
         return True, False, f"{e.code} 不支持图片（{int(latency)}ms）"
     except urllib.error.URLError as e:
         latency = (time.time() - t0) * 1000
@@ -762,8 +1032,191 @@ class ProbeModelsWorker(QThread):
 
 
 # =============================================================================
+# 快捷键速查面板
+# =============================================================================
+
+class ShortcutsDialog(QtWidgets.QDialog):
+    """全局快捷键速查面板 (Shortcuts Cheat Sheet)。"""
+
+    def __init__(self, parent=None, theme=None):
+        super().__init__(parent)
+        self.setWindowTitle("快捷键速查指南")
+        self.resize(520, 480)
+        c = theme or THEMES.get("terminal", {})
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {c.get('panel', '#1a1a1a')};
+                color: {c.get('text', '#e8e8e8')};
+            }}
+            QLabel#dialogTitle {{
+                font-size: 16px;
+                font-weight: 800;
+                color: {c.get('accent', '#3b82f6')};
+            }}
+            QLabel#groupTitle {{
+                font-size: 13px;
+                font-weight: 700;
+                color: {c.get('text', '#ffffff')};
+                padding-top: 6px;
+            }}
+            QFrame#keyCard {{
+                background-color: {c.get('bg_alt', '#0f1117')};
+                border: 1px solid {c.get('border', '#2a2e3a')};
+                border-radius: 8px;
+                padding: 4px 8px;
+            }}
+            QLabel#keyBadge {{
+                background-color: {c.get('bg', '#000000')};
+                color: {c.get('accent', '#3b82f6')};
+                border: 1px solid {c.get('border', '#3d3429')};
+                border-radius: 4px;
+                font-family: Consolas, "JetBrains Mono", monospace;
+                font-weight: 700;
+                font-size: 11px;
+                padding: 2px 6px;
+            }}
+            QLabel#keyDesc {{
+                color: {c.get('text_dim', '#888888')};
+                font-size: 12px;
+            }}
+            QPushButton#closeBtn {{
+                background-color: {c.get('accent', '#3b82f6')};
+                color: {c.get('btn_text', '#ffffff')};
+                border-radius: 6px;
+                font-weight: 700;
+                padding: 6px 20px;
+                border: none;
+            }}
+            QPushButton#closeBtn:hover {{
+                background-color: {c.get('accent_hover', '#2563eb')};
+            }}
+        """)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        title = QtWidgets.QLabel("⌨️ 全局快捷键速查 (Shortcuts Cheat Sheet)")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+
+        groups = [
+            ("🚀 导航与全局", [
+                ("Ctrl + 1", "切换至「用量统计与监控」看板"),
+                ("Ctrl + 2", "切换至「供应商与模型配置」"),
+                ("Ctrl + F", "聚焦并全选搜索框"),
+                ("F5 / Ctrl + R", "刷新看板用量数据 / 列表"),
+                ("Esc", "清空搜索框并取消焦点"),
+                ("F1", "打开此快捷键帮助面板"),
+            ]),
+            ("⚙️ 配置与操作", [
+                ("Ctrl + S", "保存当前供应商与模型配置"),
+                ("Ctrl + Enter", "将选中的模型设为系统默认"),
+                ("Ctrl + N", "添加新的 API 供应商"),
+                ("Ctrl + T", "测试当前端点连通性"),
+                ("Ctrl + Shift + T", "并发测试全部供应商连通性与延迟"),
+            ]),
+        ]
+
+        for g_title, items in groups:
+            lbl_g = QtWidgets.QLabel(g_title)
+            lbl_g.setObjectName("groupTitle")
+            layout.addWidget(lbl_g)
+
+            frame = QtWidgets.QFrame()
+            frame.setObjectName("keyCard")
+            grid = QtWidgets.QGridLayout(frame)
+            grid.setContentsMargins(10, 8, 10, 8)
+            grid.setHorizontalSpacing(16)
+            grid.setVerticalSpacing(6)
+
+            for row, (k_seq, desc) in enumerate(items):
+                badge = QtWidgets.QLabel(k_seq)
+                badge.setObjectName("keyBadge")
+                badge.setAlignment(Qt.AlignCenter)
+                grid.addWidget(badge, row, 0)
+
+                lbl_desc = QtWidgets.QLabel(desc)
+                lbl_desc.setObjectName("keyDesc")
+                grid.addWidget(lbl_desc, row, 1)
+
+            layout.addWidget(frame)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QtWidgets.QPushButton("关闭 (Esc)")
+        btn_close.setObjectName("closeBtn")
+        btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+
+# =============================================================================
 # 主窗口
 # =============================================================================
+
+class SnapshotsDialog(QtWidgets.QDialog):
+    """列出 backups/ 下的配置快照，支持恢复（恢复后重启应用生效）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("恢复配置快照")
+        self.resize(560, 380)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        hint = QtWidgets.QLabel(
+            f"每次保存前会自动备份到 {SNAPSHOTS_DIR}（保留最近 {SNAPSHOTS_KEEP} 份）。\n"
+            "选中一份快照后点“恢复”，应用将重启以加载恢复的配置。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.listw = QtWidgets.QListWidget(self)
+        if SNAPSHOTS_DIR.is_dir():
+            for d in sorted(SNAPSHOTS_DIR.iterdir(), reverse=True):
+                if not d.is_dir():
+                    continue
+                names = ", ".join(sorted(p.name for p in d.glob("*.json")))
+                item = QtWidgets.QListWidgetItem(f"{d.name}    ({names})")
+                item.setData(QtCore.Qt.UserRole, str(d))
+                self.listw.addItem(item)
+        layout.addWidget(self.listw, 1)
+
+        btns = QtWidgets.QHBoxLayout()
+        btn_open = QtWidgets.QPushButton("📂 打开备份目录")
+        btn_open.clicked.connect(lambda: os.startfile(str(SNAPSHOTS_DIR)) if SNAPSHOTS_DIR.is_dir() else None)
+        btn_restore = QtWidgets.QPushButton("⏪ 恢复选中快照")
+        btn_restore.clicked.connect(self._restore)
+        btn_cancel = QtWidgets.QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        btns.addWidget(btn_open)
+        btns.addStretch(1)
+        btns.addWidget(btn_restore)
+        btns.addWidget(btn_cancel)
+        layout.addLayout(btns)
+
+    def _restore(self):
+        item = self.listw.currentItem()
+        if item is None:
+            QtWidgets.QMessageBox.information(self, "提示", "请先选中一份快照。")
+            return
+        src = Path(item.data(QtCore.Qt.UserRole))
+        ret = QtWidgets.QMessageBox.question(
+            self, "确认恢复",
+            "将把当前配置文件覆盖为该快照内容，确定继续？",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if ret != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            for f in SNAPSHOT_FILES:
+                s = src / f
+                if s.exists():
+                    shutil.copy2(s, AGENT_DIR / f)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "恢复失败", str(exc))
+            return
+        self.accept()
+
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, store: ConfigStore):
@@ -790,6 +1243,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_menu()  # 菜单栏（必须在 _build_ui 前）
         self._build_ui()
+        self._setup_shortcuts()  # 注册全局快捷键
         self._apply_font()
         self._apply_style()
         if hasattr(self, 'dashboard_tab') and hasattr(self.dashboard_tab, '_apply_theme_to_children'):
@@ -811,6 +1265,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Tab 1: 现代仪表盘
         self.dashboard_tab = ModernDashboardTab(self)
         self.tabs.addTab(self.dashboard_tab, "📊 用量统计与监控")
+        self.tabs.setTabToolTip(0, "用量统计与监控看板 (Ctrl+1)")
 
         # Tab 2: 原有 API 供应商配置页
         config_page = QtWidgets.QWidget()
@@ -820,7 +1275,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---- 左侧：provider 列表 ----
         left = QtWidgets.QWidget()
-        left.setFixedWidth(260)
+        left.setMinimumWidth(220)
+        left.setMaximumWidth(460)
         left.setObjectName("sidebar")
         lv = QtWidgets.QVBoxLayout(left)
         lv.setContentsMargins(12, 12, 12, 12)
@@ -832,7 +1288,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 搜索过滤框
         self.ed_search = QtWidgets.QLineEdit()
-        self.ed_search.setPlaceholderText("🔍 搜索供应商或模型...")
+        self.ed_search.setPlaceholderText("🔍 搜索供应商或模型 (Ctrl+F)...")
+        self.ed_search.setToolTip("搜索供应商或模型名称 (Ctrl+F，按 Esc 清空)")
         self.ed_search.setObjectName("sidebarSearch")
         self.ed_search.textChanged.connect(self._on_search_text_changed)
         lv.addWidget(self.ed_search)
@@ -842,28 +1299,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.list_widget.currentItemChanged.connect(self.on_select)
         lv.addWidget(self.list_widget, 1)
 
-        btn_row = QtWidgets.QHBoxLayout()
+        btn_row = QtWidgets.QGridLayout()
+        btn_row.setHorizontalSpacing(6)
+        btn_row.setVerticalSpacing(6)
         self.btn_add = QtWidgets.QPushButton("＋ 添加")
+        self.btn_rename = QtWidgets.QPushButton("重命名")
         self.btn_del = QtWidgets.QPushButton("删除")
         self.btn_test_all = QtWidgets.QPushButton("⚡ 全部测速")
         self.btn_add.setObjectName("accentBtn")
+        self.btn_rename.setObjectName("ghostBtn")
         self.btn_del.setObjectName("dangerBtn")
         self.btn_test_all.setObjectName("ghostBtn")
-        self.btn_test_all.setToolTip("并发测试所有供应商端点连通性并显示延迟")
+        self.btn_add.setToolTip("添加新的 API 供应商端点 (Ctrl+N)")
+        self.btn_rename.setToolTip("修改当前供应商名称，并迁移关联配置")
+        self.btn_del.setToolTip("删除当前选中的供应商")
+        self.btn_test_all.setToolTip("并发测试所有供应商端点连通性并显示延迟 (Ctrl+Shift+T)")
         self.btn_add.clicked.connect(self.on_add)
+        self.btn_rename.clicked.connect(self.on_rename_provider)
         self.btn_del.clicked.connect(self.on_del)
         self.btn_test_all.clicked.connect(self.on_test_all_providers)
-        btn_row.addWidget(self.btn_add)
-        btn_row.addWidget(self.btn_del)
-        btn_row.addWidget(self.btn_test_all)
+        btn_row.addWidget(self.btn_add, 0, 0)
+        btn_row.addWidget(self.btn_rename, 0, 1)
+        btn_row.addWidget(self.btn_del, 1, 0)
+        btn_row.addWidget(self.btn_test_all, 1, 1)
+        btn_row.setColumnStretch(0, 1)
+        btn_row.setColumnStretch(1, 1)
         lv.addLayout(btn_row)
 
-        self.sidebar_footer = QtWidgets.QLabel("v1.0 · pi API Switcher")
+        self.sidebar_footer = QtWidgets.QLabel("v1.2 · pi API Switcher")
         self.sidebar_footer.setObjectName("sidebarFooter")
         self.sidebar_footer.setAlignment(QtCore.Qt.AlignCenter)
         lv.addWidget(self.sidebar_footer)
 
-        config_root.addWidget(left)
+        # 使用 QSplitter 允许按需拖动供应商栏宽度。
+        self.provider_splitter = QtWidgets.QSplitter(Qt.Horizontal)
+        self.provider_splitter.setObjectName("providerSplitter")
+        self.provider_splitter.setChildrenCollapsible(False)
+        self.provider_splitter.setHandleWidth(6)
+        self.provider_splitter.addWidget(left)
 
         # ---- 右侧：详情/编辑 ----
         right = QtWidgets.QWidget()
@@ -917,6 +1390,21 @@ class MainWindow(QtWidgets.QMainWindow):
         form.setHorizontalSpacing(12)
 
         self.ed_baseurl = self._add_field(form, 0, "Base URL")
+        btn_site_fill = QtWidgets.QPushButton("🌐")
+        btn_site_fill.setObjectName("eyeBtn")
+        btn_site_fill.setFixedWidth(36)
+        btn_site_fill.setToolTip("从站点管理选择一个站点，自动填充 Base URL 与 API Key")
+        btn_site_fill.clicked.connect(self._on_fill_from_site)
+        self.btn_add_to_sites = QtWidgets.QPushButton("📥")
+        self.btn_add_to_sites.setObjectName("eyeBtn")
+        self.btn_add_to_sites.setFixedWidth(36)
+        self.btn_add_to_sites.setToolTip("把当前供应商的 Base URL 与 API Key 一键加入站点管理")
+        self.btn_add_to_sites.clicked.connect(self._on_add_provider_to_sites)
+        url_btns = QtWidgets.QHBoxLayout()
+        url_btns.setSpacing(4)
+        url_btns.addWidget(btn_site_fill)
+        url_btns.addWidget(self.btn_add_to_sites)
+        form.addLayout(url_btns, 0, 2)
 
         # API Key + 显示/隐藏按钮
         form.addWidget(QtWidgets.QLabel("API Key"), 1, 0)
@@ -936,6 +1424,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.ed_model_name = self._add_field(form, 2, "显示名")
 
+        form.addWidget(QtWidgets.QLabel("缓存兼容"), 3, 0)
+        cache_row = QtWidgets.QHBoxLayout()
+        self.cache_policy_combo = QtWidgets.QComboBox()
+        for label, value in CACHE_POLICY_OPTIONS:
+            self.cache_policy_combo.addItem(label, value)
+        self.cache_policy_combo.setToolTip(
+            "自动安全：官方 OpenAI 保留缓存参数，第三方端点自动剥离；\n"
+            "严格兼容：同时禁用 prompt_cache_key、24h retention 和会话亲和头；\n"
+            "仅缓存键/长缓存：仅在端点文档明确支持时启用。"
+        )
+        self.cache_policy_hint = QtWidgets.QLabel("第三方 OpenAI-compatible 端点建议使用自动安全")
+        self.cache_policy_hint.setObjectName("fieldHint")
+        cache_row.addWidget(self.cache_policy_combo, 1)
+        cache_row.addWidget(self.cache_policy_hint)
+        form.addLayout(cache_row, 3, 1)
+
         rv.addLayout(form)
 
         # ---- 多模型表格 ----
@@ -950,6 +1454,12 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.model_table.setObjectName("modelTable")
         self.model_table.setAlternatingRowColors(True)
+        # 固定数字列的最小内容宽度；窄窗口时使用水平滚动，避免相邻单元格文字重叠。
+        self.model_table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.model_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.model_table.setWordWrap(False)
+        self.model_table.setTextElideMode(QtCore.Qt.ElideNone)
+        self.model_table.horizontalHeader().setMinimumSectionSize(40)
         self.model_table.horizontalHeader().setStretchLastSection(False)
         self.model_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         self.model_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
@@ -963,9 +1473,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.model_table.setColumnWidth(2, 48)   # 推理
         self.model_table.setColumnWidth(3, 110)  # 输入
         self.model_table.setColumnWidth(4, 88)   # 思考上限
-        self.model_table.setColumnWidth(5, 120)  # 上下文 (由 92 扩至 120，轻松容纳 7-8 位数字)
-        self.model_table.setColumnWidth(6, 96)   # 最大输出 (由 84 扩至 96)
+        self.model_table.setColumnWidth(5, 128)  # 上下文，容纳 7-8 位数字
+        self.model_table.setColumnWidth(6, 112)  # 最大输出，避免与上下文列重叠
         self.model_table.setColumnWidth(7, 150)  # 视觉模型
+        self.model_table.setMinimumWidth(48 + 110 + 88 + 110 + 88 + 128 + 112 + 150 + 24)
         # 关键：禁用排序，避免点击表头时 cell widget（复选框/下拉框/按钮）错位
         self.model_table.setSortingEnabled(False)
         # 数字列双击编辑，其余列通过 widget 交互；文本列双击编辑
@@ -1008,6 +1519,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_test.setObjectName("ghostBtn")
         self.btn_save.setObjectName("accentBtn")
         self.btn_default.setObjectName("primaryBtn")
+        self.btn_test.setToolTip("测试当前端点连通性与模型列表 (Ctrl+T)")
+        self.btn_save.setToolTip("保存当前供应商与模型配置 (Ctrl+S)")
+        self.btn_default.setToolTip("将当前选中的模型设为系统默认并写入 settings.json (Ctrl+Enter)")
         self.btn_test.clicked.connect(self.on_test)
         self.btn_save.clicked.connect(self.on_save)
         self.btn_default.clicked.connect(self.on_set_default)
@@ -1032,9 +1546,20 @@ class MainWindow(QtWidgets.QMainWindow):
         status_row.addWidget(self.loading_dots)
         rv.addLayout(status_row)
 
-        config_root.addWidget(right, 1)
+        self.provider_splitter.addWidget(right)
+        self.provider_splitter.setStretchFactor(0, 0)
+        self.provider_splitter.setStretchFactor(1, 1)
+        self.provider_splitter.setSizes([260, 800])
+        config_root.addWidget(self.provider_splitter, 1)
 
         self.tabs.addTab(config_page, "⚙️ 供应商与模型配置")
+        self.tabs.setTabToolTip(1, "供应商端点与模型配置 (Ctrl+2)")
+
+        self.ext_tab = SkillsExtensionsTab(self.store)
+        self.tabs.addTab(self.ext_tab, "🧩 技能与插件")
+
+        self.sites_tab = SitesTab(self)
+        self.tabs.addTab(self.sites_tab, "🌐 站点管理")
         root.addWidget(self.tabs)
 
     def _add_field(self, form, row, label):
@@ -1058,9 +1583,14 @@ class MainWindow(QtWidgets.QMainWindow):
         return QtGui.QIcon(pix)
 
     def _build_menu(self):
-        """构建顶部菜单栏：外观（主题 + 字体）。"""
+        """构建顶部菜单栏：外观（主题 + 字体）、工具（快照恢复）。"""
         bar = self.menuBar()
         bar.setObjectName("menuBar")
+
+        # 工具菜单
+        menu_tools = bar.addMenu("工具")
+        act_snapshots = menu_tools.addAction("⏪ 恢复配置快照...")
+        act_snapshots.triggered.connect(self.show_snapshots_dialog)
 
         # 外观菜单
         menu_view = bar.addMenu("外观")
@@ -1117,6 +1647,123 @@ class MainWindow(QtWidgets.QMainWindow):
             act.setChecked(sz == self.font_size)
             size_group.addAction(act)
             act.triggered.connect(lambda _=False, s=sz: self._switch_font_size(s))
+
+        # 帮助菜单
+        menu_help = bar.addMenu("帮助")
+        act_shortcuts = menu_help.addAction("⌨️ 快捷键速查 (F1)")
+        act_shortcuts.triggered.connect(self.show_shortcuts_dialog)
+        menu_help.addSeparator()
+        act_about = menu_help.addAction("ℹ️ 关于 pi API Switcher")
+        act_about.triggered.connect(self.show_about_dialog)
+
+    def _setup_shortcuts(self):
+        """注册全局高效快捷键映射。"""
+        # 保存与设为默认
+        QShortcut(QKeySequence("Ctrl+S"), self, self.on_save)
+        QShortcut(QKeySequence("Ctrl+Return"), self, self.on_set_default)
+        QShortcut(QKeySequence("Ctrl+Enter"), self, self.on_set_default)
+
+        # 连通性测试
+        QShortcut(QKeySequence("Ctrl+T"), self, self.on_test)
+        QShortcut(QKeySequence("Ctrl+Shift+T"), self, self.on_test_all_providers)
+
+        # 供应商管理
+        QShortcut(QKeySequence("Ctrl+N"), self, self.on_add)
+        QShortcut(QKeySequence("Ctrl+F"), self, self._focus_search)
+
+        # 选项卡切换
+        QShortcut(QKeySequence("Ctrl+1"), self, lambda: self.tabs.setCurrentIndex(0))
+        QShortcut(QKeySequence("Ctrl+2"), self, lambda: self.tabs.setCurrentIndex(1))
+
+        # 刷新
+        QShortcut(QKeySequence("Ctrl+R"), self, self._on_global_refresh)
+        QShortcut(QKeySequence("F5"), self, self._on_global_refresh)
+
+        # 帮助与退出
+        QShortcut(QKeySequence("F1"), self, self.show_shortcuts_dialog)
+        QShortcut(QKeySequence("Esc"), self, self._on_escape)
+
+    def _focus_search(self):
+        if self.tabs.currentIndex() != 1:
+            self.tabs.setCurrentIndex(1)
+        self.ed_search.setFocus()
+        self.ed_search.selectAll()
+
+    def _on_global_refresh(self):
+        if self.tabs.currentIndex() == 0:
+            self.dashboard_tab.load_data()
+            self.show_toast("🔄 看板用量数据已刷新")
+        else:
+            self.refresh_list()
+            self.show_toast("🔄 供应商配置列表已刷新")
+
+    def _on_escape(self):
+        if self.ed_search.hasFocus():
+            self.ed_search.clear()
+            self.list_widget.setFocus()
+
+    def show_shortcuts_dialog(self):
+        c = THEMES.get(self.theme_name, THEMES["terminal"])
+        dlg = ShortcutsDialog(self, theme=c)
+        dlg.exec_()
+
+    def _on_add_provider_to_sites(self):
+        """一键把当前编辑中的供应商 (Base URL + API Key) 加入站点管理。"""
+        base_url = self.ed_baseurl.text().strip()
+        if not base_url:
+            self.set_status("Base URL 为空，无法加入站点管理", "warn")
+            return
+        key = self.ed_apikey.text().strip()
+        sites = self.sites_tab._sites()
+        # 同 URL 同 Key 视为重复；同 URL 不同 Key 是不同账号，允许并存
+        for s in sites:
+            if s.get("baseUrl", "") == base_url and s.get("apiKey", "") == key:
+                self.set_status(f"已存在于站点管理：{s.get('name', '')}", "info")
+                self.show_toast(f"ℹ️ 站点「{s.get('name', '')}」已存在，无需重复添加")
+                return
+        name = self.current_name() or base_url.split("//", 1)[-1].split("/", 1)[0]
+        sites.append({"name": name, "baseUrl": base_url, "apiKey": key,
+                      "note": f"来自供应商 {self.current_name()}"})
+        self.sites_tab._save()
+        self.sites_tab.reload()
+        self.show_toast(f"✓ 已加入站点管理：{name}")
+        self.set_status(f"已加入站点管理：{name}", "ok")
+
+    def _on_fill_from_site(self):
+        """从站点管理选一个站点，填充 Base URL 与 API Key。"""
+        site = self.sites_tab.fill_provider_from_site()
+        if not site:
+            return
+        self.ed_baseurl.setText(site.get("baseUrl", ""))
+        if site.get("apiKey"):
+            self.ed_apikey.setText(site["apiKey"])
+            self.set_status(f"已从站点「{site['name']}」填充 Base URL 与 API Key", "ok")
+        else:
+            self.set_status(f"已从站点「{site['name']}」填充 Base URL（该站点未配置 Key）", "info")
+
+    def show_snapshots_dialog(self):
+        dlg = SnapshotsDialog(self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            ret = QtWidgets.QMessageBox.question(
+                self, "重启应用",
+                "快照已恢复。立即重启应用以加载恢复的配置？\n（选择“否”则下次手动启动时生效）",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes)
+            if ret == QtWidgets.QMessageBox.Yes:
+                # 重启自身：frozen 时 sys.executable 是 exe，开发态是 python.exe
+                subprocess.Popen([sys.executable] + sys.argv,
+                                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+                QtWidgets.qApp.quit()
+
+    def show_about_dialog(self):
+        QtWidgets.QMessageBox.about(
+            self,
+            "关于 pi API Switcher",
+            "<h3>pi API Switcher</h3>"
+            "<p>CC Switch 风格的 pi API / 模型配置桌面管理器 (PyQt5)。</p>"
+            "<p>支持快速切换默认模型、用量监控看板、并发测速、视觉模型桥接、缓存兼容防护与全局快捷键体系。</p>"
+            "<p>项目主页: <a href='https://github.com/2931735386-stack/pi-api-'>GitHub Repository</a></p>"
+        )
 
     def _switch_theme(self, name):
         self.theme_name = name
@@ -1183,6 +1830,7 @@ class MainWindow(QtWidgets.QMainWindow):
             /* === 全局 === */
             QMainWindow, QWidget {{ background: {c['bg']}; color: {c['text']}; }}
             QLabel {{ color: {c['text_dim']}; font-size: 13px; }}
+            QLabel#fieldHint {{ color: {c['text_dim']}; font-size: 11px; padding-left: 6px; }}
             QToolTip {{
                 background-color: {c['panel']};
                 color: {c['text']};
@@ -1290,6 +1938,16 @@ class MainWindow(QtWidgets.QMainWindow):
             }}
             #modelTable QWidget {{
                 background: transparent;
+            }}
+            /* 原地编辑器必须不透明，否则会和底层 item 文本发生重影。 */
+            #modelTable QLineEdit {{
+                background: {c['panel']};
+                color: {c['text']};
+                border: 1px solid {c['accent']};
+                border-radius: 3px;
+                padding: 0 6px;
+                selection-background-color: {c['accent']};
+                selection-color: {c['btn_text']};
             }}
             #modelTable QComboBox {{
                 background: {c['panel']};
@@ -1679,7 +2337,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in [self.ed_baseurl.parentWidget() or self.ed_baseurl,
                   self.ed_apikey.parentWidget() or self.ed_apikey,
                   self.model_table, self.btn_test, self.btn_save, self.btn_default,
-                  self.lbl_default]:
+                  self.btn_rename, self.lbl_default]:
             if w:
                 w.setVisible(has_any)
         if current_sel:
@@ -1749,6 +2407,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # 显示名
         if self.ed_model_name.text().strip() != (p.get("name") or ""):
             return True
+        # 缓存兼容策略
+        if normalize_cache_policy(self.cache_policy_combo.currentData()) != self.store.cache_policy(name):
+            return True
         # 模型表格
         table_models = self._read_model_table()
         stored_models = p.get("models", [])
@@ -1769,7 +2430,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 return True
             if tm.get("maxTokens", 16384) != sm.get("maxTokens", 16384):
                 return True
-            if tm.get("visionModel", "") != sm.get("visionModel", ""):
+            stored_route = self.store.vision_route(name, sm)
+            if normalize_vision_mode(tm.get("visionMode")) != stored_route.get("mode", "auto"):
+                return True
+            if normalize_candidates(tm.get("visionModel", "")) != stored_route.get("candidates", []):
                 return True
         return False
 
@@ -1813,6 +2477,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_baseurl.setText(p.get("baseUrl", ""))
         self.ed_apikey.setText(self.store.api_key(name))
         self.ed_model_name.setText(p.get("name", ""))
+        cache_policy = self.store.cache_policy(name)
+        policy_index = self.cache_policy_combo.findData(cache_policy)
+        self.cache_policy_combo.setCurrentIndex(max(0, policy_index))
 
         # 填充模型表格（多模型）
         self._fill_model_table(p.get("models", []))
@@ -1834,7 +2501,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _fill_model_table(self, models):
         """将模型列表填到表格中。"""
         self.model_table.setRowCount(0)
+        provider_name = self.current_name() or ""
         for m in models:
+            route = self.store.vision_route(provider_name, m)
             self._add_model_row(
                 m.get("id", ""),
                 m.get("name", ""),
@@ -1843,14 +2512,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 get_max_thinking_level(m),
                 m.get("contextWindow", 128000),
                 m.get("maxTokens", 16384),
-                m.get("visionModel", ""),
+                candidates_to_legacy(route.get("candidates", [])),
+                route.get("mode", "auto"),
             )
         # 若表格为空，加一行空行便于编辑
         if self.model_table.rowCount() == 0:
             self._add_model_row("", "", False, "text", "off", 128000, 16384, "")
 
     def _add_model_row(self, mid, name, reasoning, input_types, max_thinking="off",
-                       context_window=128000, max_tokens=16384, vision_model=""):
+                       context_window=128000, max_tokens=16384, vision_model="",
+                       vision_mode="auto"):
         row = self.model_table.rowCount()
         self.model_table.insertRow(row)
 
@@ -1902,19 +2573,24 @@ class MainWindow(QtWidgets.QMainWindow):
         item_ctx = QtWidgets.QTableWidgetItem(str(context_window))
         item_ctx.setData(QtCore.Qt.UserRole, context_window)
         item_ctx.setTextAlignment(QtCore.Qt.AlignCenter)
+        item_ctx.setTextAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignHCenter)
+        item_ctx.setToolTip(str(context_window))
         self.model_table.setItem(row, 5, item_ctx)
 
         # 列6：最大输出 tokens（居中对齐）
         item_max = QtWidgets.QTableWidgetItem(str(max_tokens))
         item_max.setData(QtCore.Qt.UserRole, max_tokens)
-        item_max.setTextAlignment(QtCore.Qt.AlignCenter)
+        item_max.setTextAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignHCenter)
+        item_max.setToolTip(str(max_tokens))
         self.model_table.setItem(row, 6, item_max)
 
         # 列7：视觉模型（纯文本模型可挂一个视觉插件）
         vision_btn = QtWidgets.QPushButton()
         vision_btn.setFocusPolicy(QtCore.Qt.NoFocus)
         vision_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self._update_vision_btn(vision_btn, vision_model, input_types, name or mid)
+        self._update_vision_btn(
+            vision_btn, vision_model, input_types, name or mid, vision_mode
+        )
         vision_btn.clicked.connect(
             lambda _=False, b=vision_btn: self._on_pick_vision_model(
                 self.model_table.indexAt(b.pos()).row())
@@ -1933,12 +2609,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not checked:
             think_combo.setCurrentText("off")
 
-    # ---- 视觉模型（视觉插件） ----
-    def _update_vision_btn(self, btn, vision_model, input_types, model_name=""):
-        """更新视觉桥接按钮文案与状态。
-        vision_model 格式：provider:modelId（可含多个，用 | 分隔）。
-        需配合 ~/.pi/agent/extensions/vision-bridge.ts 将图片转写为文本。
-        model_name：当前模型自己的名称（用于自身支持图片时的标识）。"""
+    # ---- 视觉模型（Vision Bridge v2） ----
+    def _update_vision_btn(self, btn, vision_model, input_types, model_name="",
+                           vision_mode="auto"):
+        """更新视觉模式、候选链和有效路由提示。"""
+        candidates = normalize_candidates(vision_model)
+        legacy_value = candidates_to_legacy(candidates)
+        mode = normalize_vision_mode(vision_mode)
         has_image = "image" in [x.strip() for x in (input_types or "").split(",")]
         btn.setStyleSheet("""
             QPushButton {
@@ -1946,127 +2623,178 @@ class MainWindow(QtWidgets.QMainWindow):
                 font-size: 11px; background: transparent;
             }
             QPushButton:hover { background: rgba(128,128,128,0.15); }
-            QPushButton:disabled { color: #888888; }
         """)
-        if vision_model:
-            # 已挂接视觉桥接
-            short = self._short_vision_label(vision_model)
-            btn.setText(f"🎯 {short}")
-            btn.setEnabled(True)
-            btn.setToolTip(f"视觉桥接：{vision_model}\n由 vision-bridge.ts 转写图片后交给主模型\n点击更换或清除")
-            btn.setProperty("visionModel", vision_model)
+        first = self._short_vision_label(legacy_value) if candidates else ""
+        fallback = f" +{len(candidates) - 1}" if len(candidates) > 1 else ""
+        if mode == "off":
+            text = "🚫 关闭图片"
+            effective = "拒绝图片"
+        elif mode == "native":
+            text = "🖼 原生直传" if has_image else "⚠ 原生不可用"
+            effective = "主模型直接接收图片" if has_image else "纯文本主模型将拒绝图片"
+        elif mode == "force":
+            text = f"🎯 强制 {first}{fallback}" if candidates else "⚠ 强制未配置"
+            effective = "始终先调用视觉候选链"
         elif has_image:
-            # 自身支持图片，但也可选择挂接其他视觉桥接
-            label = model_name or "视觉"
-            if len(label) > 14:
-                label = label[:13] + "…"
-            btn.setText(f"🖼 {label}")
-            btn.setEnabled(True)
-            btn.setToolTip(f"该模型自身支持图片（{model_name or '视觉模型'}）\n点击可选择挂接其他视觉桥接")
-            btn.setProperty("visionModel", "")
+            text = "🖼 自动·原生"
+            effective = "主模型原生接收图片"
+        elif candidates:
+            text = f"🎯 自动 {first}{fallback}"
+            effective = "纯文本主模型使用视觉候选链"
         else:
-            btn.setText("＋ 添加")
-            btn.setEnabled(True)
-            btn.setToolTip("为纯文本模型挂接视觉桥接（需要 vision-bridge.ts）")
-            btn.setProperty("visionModel", "")
+            text = "＋ 配置视觉"
+            effective = "纯文本主模型尚无视觉候选"
+        btn.setText(text)
+        btn.setEnabled(True)
+        btn.setToolTip(
+            f"模式：{mode}\n有效行为：{effective}\n"
+            f"候选顺序：{' → '.join(candidates) if candidates else '(无)'}\n"
+            "点击配置模式、候选与回退优先级"
+        )
+        btn.setProperty("visionModel", legacy_value)
+        btn.setProperty("visionMode", mode)
 
     def _short_vision_label(self, vision_model):
-        """把 provider:modelId 转成友好的视觉模型显示名（provider / 模型名）。
-        优先用模型在 store 里的 name，回退到 modelId。"""
-        if not vision_model:
+        """把第一个 provider/model 候选转成友好显示名。"""
+        candidates = normalize_candidates(vision_model)
+        if not candidates:
             return ""
-        # 取第一个（可能多个，用 | 分隔）
-        first = vision_model.split("|")[0].strip()
-        provider = ""
-        model_id = first
-        if ":" in first:
-            provider, model_id = first.split(":", 1)
-            provider = provider.strip()
-            model_id = model_id.strip()
-        # 从 store 查模型的真实 name
+        provider, model_id = candidates[0].split("/", 1)
         display = model_id
-        if provider:
-            p = self.store.get_provider(provider)
-            for m in p.get("models", []):
-                if m.get("id") == model_id:
-                    display = m.get("name") or model_id
-                    break
-        # 拼接 provider / name
-        label = f"{provider} / {display}" if provider else display
-        # 过长则截断
+        p = self.store.get_provider(provider)
+        for model in p.get("models", []):
+            if model.get("id") == model_id:
+                display = model.get("name") or model_id
+                break
+        label = f"{provider}/{display}"
         return label if len(label) <= 22 else label[:21] + "…"
 
     def _vision_btn_at(self, row):
-        """获取某行视觉模型按钮（兼容 cell widget 为容器的情况）。"""
-        w = self.model_table.cellWidget(row, 7)
-        if w is None:
+        """获取某行视觉配置按钮（兼容 cell widget 容器）。"""
+        widget = self.model_table.cellWidget(row, 7)
+        if widget is None:
             return None
-        if isinstance(w, QtWidgets.QPushButton):
-            return w
-        # 容器内查找按钮
-        return w.findChild(QtWidgets.QPushButton)
+        if isinstance(widget, QtWidgets.QPushButton):
+            return widget
+        return widget.findChild(QtWidgets.QPushButton)
 
     def _on_input_changed(self, row, txt):
-        """输入类型下拉变化时，更新该行视觉模型按钮状态。"""
+        """输入能力变化时重新计算视觉模式的有效行为。"""
         if row < 0:
             return
         btn = self._vision_btn_at(row)
-        if btn:
-            vision = btn.property("visionModel") or ""
-            # 从表格取模型名称（列1 显示名，回退到列0 模型 ID）
-            name_item = self.model_table.item(row, 1)
-            id_item = self.model_table.item(row, 0)
-            model_name = (name_item.text().strip() if name_item else "") or \
-                         (id_item.text().strip() if id_item else "")
-            self._update_vision_btn(btn, vision, txt, model_name)
+        if not btn:
+            return
+        name_item = self.model_table.item(row, 1)
+        id_item = self.model_table.item(row, 0)
+        model_name = (name_item.text().strip() if name_item else "") or \
+                     (id_item.text().strip() if id_item else "")
+        self._update_vision_btn(
+            btn,
+            btn.property("visionModel") or "",
+            txt,
+            model_name,
+            btn.property("visionMode") or "auto",
+        )
 
     def _on_pick_vision_model(self, row):
-        """为模型选择/更换视觉桥接（所有模型都可选择）。"""
+        """编辑视觉模式及有序的多模型回退链。"""
         if row < 0:
             return
-
-        # 复用已有方法收集所有可用的视觉模型，避免内联重复逻辑
-        candidates = self._collect_vision_candidates()
-
-        if not candidates:
-            QtWidgets.QMessageBox.information(
-                self, "无可用视觉模型",
-                "当前没有配置任何支持图像输入的模型。\n\n"
-                "请先在某供应商下添加一个 input 为 text,image 的模型。"
-            )
+        btn = self._vision_btn_at(row)
+        if not btn:
             return
+        available = self._collect_vision_candidates()
+        current = normalize_candidates(btn.property("visionModel") or "")
+        current_mode = normalize_vision_mode(btn.property("visionMode") or "auto")
+
+        # 已保存但当前不可用的候选仍展示并标记，防止静默丢配置。
+        available_map = {value: label for label, value in available}
+        ordered_values = current + [value for _, value in available if value not in current]
 
         box = QtWidgets.QDialog(self)
-        box.setWindowTitle("选择视觉模型（视觉插件）")
-        box.resize(420, 380)
+        box.setWindowTitle("Vision Bridge v2 配置")
+        box.resize(560, 520)
         lay = QtWidgets.QVBoxLayout(box)
 
-        tip = QtWidgets.QLabel("为主模型挂接视觉桥接：图片将先转写为文本，再交给主模型（需要 vision-bridge.ts）：")
+        tip = QtWidgets.QLabel(
+            "选择运行模式与候选模型。勾选多个候选可自动回退；"
+            "拖动列表项可调整优先级。"
+        )
         tip.setWordWrap(True)
         lay.addWidget(tip)
 
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.addWidget(QtWidgets.QLabel("运行模式"))
+        mode_combo = QtWidgets.QComboBox()
+        for label, value in VISION_MODE_OPTIONS:
+            mode_combo.addItem(label, value)
+        mode_combo.setCurrentIndex(max(0, mode_combo.findData(current_mode)))
+        mode_row.addWidget(mode_combo, 1)
+        lay.addLayout(mode_row)
+
+        mode_help = QtWidgets.QLabel(
+            "自动：原生视觉直传，纯文本走桥接；原生：只允许主模型直传；"
+            "强制：即使主模型支持图片也先桥接；关闭：移除并拒绝图片。"
+        )
+        mode_help.setWordWrap(True)
+        mode_help.setObjectName("fieldHint")
+        lay.addWidget(mode_help)
+
         lst = QtWidgets.QListWidget()
-        for label, _ in candidates:
-            lst.addItem(label)
-        lay.addWidget(lst)
+        lst.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
+        lst.setDefaultDropAction(QtCore.Qt.MoveAction)
+        for value in ordered_values:
+            label = available_map.get(value, f"⚠ 当前不可用 · {value}")
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(QtCore.Qt.UserRole, value)
+            item.setFlags(
+                item.flags() | QtCore.Qt.ItemIsUserCheckable
+                | QtCore.Qt.ItemIsDragEnabled | QtCore.Qt.ItemIsDropEnabled
+            )
+            item.setCheckState(QtCore.Qt.Checked if value in current else QtCore.Qt.Unchecked)
+            lst.addItem(item)
+        lay.addWidget(lst, 1)
 
-        # 清除选项
-        btn_clear = QtWidgets.QPushButton("清除视觉插件")
+        btn_clear = QtWidgets.QPushButton("清空候选")
         btn_clear.setObjectName("dangerBtn")
-
-        btn_row = QtWidgets.QHBoxLayout()
+        btn_cancel = QtWidgets.QPushButton("取消")
         btn_ok = QtWidgets.QPushButton("确定")
         btn_ok.setObjectName("accentBtn")
-        btn_cancel = QtWidgets.QPushButton("取消")
+        btn_row = QtWidgets.QHBoxLayout()
         btn_row.addWidget(btn_clear)
         btn_row.addStretch(1)
         btn_row.addWidget(btn_cancel)
         btn_row.addWidget(btn_ok)
         lay.addLayout(btn_row)
 
-        btn_ok.clicked.connect(box.accept)
+        btn_clear.clicked.connect(
+            lambda: [lst.item(i).setCheckState(QtCore.Qt.Unchecked) for i in range(lst.count())]
+        )
         btn_cancel.clicked.connect(box.reject)
-        btn_clear.clicked.connect(lambda: (lst.clearSelection(), box.done(2)))
+
+        def selected_candidates():
+            return [
+                lst.item(i).data(QtCore.Qt.UserRole)
+                for i in range(lst.count())
+                if lst.item(i).checkState() == QtCore.Qt.Checked
+            ]
+
+        def accept_config():
+            mode = normalize_vision_mode(mode_combo.currentData())
+            selected = selected_candidates()
+            input_combo = self.model_table.cellWidget(row, 3)
+            input_types = input_combo.currentText() if isinstance(input_combo, QtWidgets.QComboBox) else "text"
+            has_image = "image" in input_types.split(",")
+            if mode == "force" and not selected:
+                QtWidgets.QMessageBox.warning(box, "缺少候选", "强制桥接模式至少需要一个视觉模型。")
+                return
+            if mode == "auto" and not has_image and not selected:
+                QtWidgets.QMessageBox.warning(box, "缺少候选", "纯文本模型的自动模式至少需要一个视觉模型。")
+                return
+            box.accept()
+
+        btn_ok.clicked.connect(accept_config)
 
         c = COLORS
         box.setStyleSheet(f"""
@@ -2074,39 +2802,33 @@ class MainWindow(QtWidgets.QMainWindow):
             QLabel {{ color: {c['text']}; font-size: 13px; }}
             QListWidget {{ background: {c['panel']}; border: 1px solid {c['border']}; border-radius: 6px;
                            color: {c['text']}; font-size: 13px; }}
-            QListWidget::item {{ padding: 6px 8px; }}
+            QListWidget::item {{ padding: 7px 8px; }}
             QListWidget::item:selected {{ background: {c['accent']}; color: {c['btn_text']}; }}
+            QComboBox {{ background: {c['panel']}; color: {c['text']}; border: 1px solid {c['border']};
+                         border-radius: 6px; padding: 6px 10px; }}
             QPushButton {{ background: {c['panel']}; color: {c['text']}; border-radius: 6px;
                            padding: 8px 14px; font-size: 13px; }}
             QPushButton#accentBtn {{ background: {c['accent']}; color: {c['btn_text']}; font-weight: 600; }}
             QPushButton#dangerBtn {{ background: transparent; color: {c['red']}; border: 1px solid {c['red']}; }}
         """)
 
-        ret = box.exec_()
-        btn = self._vision_btn_at(row)
-        if not btn:
+        if box.exec_() != QtWidgets.QDialog.Accepted:
             return
-
-        # 获取当前行的输入类型与模型名（清除后需正确恢复显示）
-        cw = self.model_table.cellWidget(row, 3)
-        input_types = cw.currentText() if (cw and isinstance(cw, QtWidgets.QComboBox)) else "text"
+        input_combo = self.model_table.cellWidget(row, 3)
+        input_types = input_combo.currentText() if isinstance(input_combo, QtWidgets.QComboBox) else "text"
         name_item = self.model_table.item(row, 1)
         id_item = self.model_table.item(row, 0)
         model_name = (name_item.text().strip() if name_item else "") or \
                      (id_item.text().strip() if id_item else "")
-
-        if ret == 2:  # 清除
-            self._update_vision_btn(btn, "", input_types, model_name)
-            return
-        if ret != QtWidgets.QDialog.Accepted:
-            return
-
-        sel = lst.currentRow()
-        if sel < 0:
-            return
-        label, vision_str = candidates[sel]
-        self._update_vision_btn(btn, vision_str, input_types, model_name)
-        self.set_status(f"已挂接视觉插件：{label}（记得点保存）", "info")
+        mode = normalize_vision_mode(mode_combo.currentData())
+        selected = selected_candidates()
+        self._update_vision_btn(
+            btn, candidates_to_legacy(selected), input_types, model_name, mode
+        )
+        self.set_status(
+            f"视觉配置已更新：{mode} · {len(selected)} 个候选（记得点保存）",
+            "info",
+        )
 
     def _read_model_table(self):
         """从表格读取模型列表（忽略空 ID 的行）。"""
@@ -2143,11 +2865,13 @@ class MainWindow(QtWidgets.QMainWindow):
             context_window = self._read_int_cell(row, 5, 128000)
             max_tokens = self._read_int_cell(row, 6, 16384)
 
-            # 视觉模型
+            # Vision Bridge v2：有序候选链 + 模式
             vision_model = ""
+            vision_mode = "auto"
             vbtn = self._vision_btn_at(row)
             if vbtn:
                 vision_model = vbtn.property("visionModel") or ""
+                vision_mode = normalize_vision_mode(vbtn.property("visionMode") or "auto")
 
             model = {
                 "id": mid,
@@ -2160,9 +2884,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # 只有推理模型才写 thinkingLevelMap
             if reasoning and max_think != "off":
                 model["thinkingLevelMap"] = build_thinking_map(max_think)
-            # 纯文本模型挂视觉插件
+            # 同时写入旧字段和 v2 模式，支持旧版回滚与新运行时。
             if vision_model:
-                model["visionModel"] = vision_model
+                model["visionModel"] = candidates_to_legacy(normalize_candidates(vision_model))
+            model["visionMode"] = vision_mode
             models.append(model)
         return models
 
@@ -2214,6 +2939,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_list(select_name=name)
         self._refresh_tray()
 
+    def on_rename_provider(self):
+        old_name = self.current_name()
+        if not old_name:
+            self.set_status("请先选择供应商", "warn")
+            return
+        new_name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "修改供应商名称",
+            "供应商名称（仅支持字母、数字、点、下划线和短横线）:",
+            QtWidgets.QLineEdit.Normal,
+            old_name,
+        )
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", new_name):
+            QtWidgets.QMessageBox.warning(
+                self, "名称无效", "名称只能包含字母、数字、点（.）、下划线（_）和短横线（-）。"
+            )
+            return
+        if new_name == old_name:
+            return
+        if new_name in self.store.provider_names():
+            QtWidgets.QMessageBox.warning(self, "已存在", f"供应商 '{new_name}' 已存在。")
+            return
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "确认修改名称",
+            f"将供应商「{old_name}」改为「{new_name}」，并同步迁移 API Key、默认设置、缓存策略和视觉路由。\n是否继续？",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if confirm != QtWidgets.QMessageBox.Yes:
+            return
+        snapshot = {
+            "models": deepcopy(self.store.models),
+            "auth": deepcopy(self.store.auth),
+            "settings": deepcopy(self.store.settings),
+            "cache_guard": deepcopy(self.store.cache_guard),
+            "vision": deepcopy(self.store.vision),
+        }
+        try:
+            self.store.rename_provider(old_name, new_name)
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "修改失败", str(exc))
+            return
+        if not self.store.save():
+            self.store.models = snapshot["models"]
+            self.store.auth = snapshot["auth"]
+            self.store.settings = snapshot["settings"]
+            self.store.cache_guard = snapshot["cache_guard"]
+            self.store.vision = snapshot["vision"]
+            self.store.save()
+            self.refresh_list(select_name=old_name)
+            QtWidgets.QMessageBox.critical(
+                self, "保存失败", "修改供应商名称失败，已恢复原名称，请检查文件写入权限。"
+            )
+            return
+        self._provider_test_results.pop(old_name, None)
+        self.refresh_list(select_name=new_name)
+        self._refresh_tray()
+        self.set_status(f"已将供应商 {old_name} 重命名为 {new_name}", "ok")
+        self.show_toast(f"✓ 供应商已改名：{new_name}")
+
     def on_del(self):
         name = self.current_name()
         if not name:
@@ -2255,8 +3044,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "提示", "Base URL 必须以 http:// 或 https:// 开头")
             return
 
-        # 从表格读取多模型
-        models = self._read_model_table()
+        # 从表格读取多模型；保留 GUI 未展示的 compat/cost/headers 等高级字段。
+        models = merge_model_edits(p.get("models", []), self._read_model_table())
         if not models:
             QtWidgets.QMessageBox.warning(self, "提示", "至少需要一个模型（请填写模型 ID）")
             return
@@ -2264,6 +3053,12 @@ class MainWindow(QtWidgets.QMainWindow):
         p["baseUrl"] = base_url
         p["name"] = self.ed_model_name.text().strip() or name
         p["models"] = models
+        self.store.sync_vision_routes(name, models)
+
+        # 缓存兼容：OpenAI 请求格式不等于支持 OpenAI 专有缓存字段。
+        cache_policy = normalize_cache_policy(self.cache_policy_combo.currentData())
+        self.store.set_cache_policy(name, cache_policy)
+        effective_policy = apply_provider_cache_compat(p, cache_policy)
 
         # 同步 enabledModels 白名单（让 pi /model 能显示这些模型）
         self.store.sync_enabled_models(name)
@@ -2273,7 +3068,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.store.set_api_key(name, key)
 
         if self.store.save():
-            self.set_status(f"已保存 {name}（{len(models)} 个模型）· 重启 pi 或执行 /reload 生效", "ok")
+            self.set_status(
+                f"已保存 {name}（{len(models)} 个模型）· 缓存策略 {effective_policy} · "
+                "重启 pi 或执行 /reload 生效",
+                "ok",
+            )
             self.show_toast(f"💾 已成功保存配置：{name}")
             self.refresh_list(select_name=name)
             self._refresh_tray()
@@ -2336,9 +3135,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._test_worker.start()
 
     def show_toast(self, message, duration=2200):
-        """在窗口中上方弹出平滑淡入淡出的现代胶囊 Toast 提示。"""
+        """在窗口中上方弹出平滑淡入淡出与位移动效的现代胶囊 Toast 提示。"""
         if hasattr(self, "_toast_label") and self._toast_label:
-            self._toast_label.deleteLater()
+            try:
+                self._toast_label.deleteLater()
+            except Exception:
+                pass
             self._toast_label = None
 
         toast = QtWidgets.QFrame(self)
@@ -2346,21 +3148,66 @@ class MainWindow(QtWidgets.QMainWindow):
         toast.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
 
         layout = QtWidgets.QHBoxLayout(toast)
-        layout.setContentsMargins(18, 8, 18, 8)
+        layout.setContentsMargins(18, 9, 18, 9)
         lbl = QtWidgets.QLabel(message, toast)
         lbl.setObjectName("toastText")
         layout.addWidget(lbl)
 
         toast.adjustSize()
-        # 居中偏上位置
-        x = (self.width() - toast.width()) // 2
-        y = 48
-        toast.move(x, y)
+        w = toast.width()
+        x = (self.width() - w) // 2
+        start_y = 26
+        target_y = 48
+        toast.move(x, start_y)
+
+        # 挂载不透明度滤镜
+        opacity_effect = QtWidgets.QGraphicsOpacityEffect(toast)
+        toast.setGraphicsEffect(opacity_effect)
+        opacity_effect.setOpacity(0.0)
+
         toast.show()
         self._toast_label = toast
 
-        # 渐隐定时器
-        QtCore.QTimer.singleShot(duration, toast.deleteLater)
+        # 进入动画：位置下滑 + 不透明度淡入
+        anim_pos = QPropertyAnimation(toast, b"pos", self)
+        anim_pos.setDuration(220)
+        anim_pos.setStartValue(QPoint(x, start_y))
+        anim_pos.setEndValue(QPoint(x, target_y))
+        anim_pos.setEasingCurve(QEasingCurve.OutCubic)
+
+        anim_op = QPropertyAnimation(opacity_effect, b"opacity", self)
+        anim_op.setDuration(220)
+        anim_op.setStartValue(0.0)
+        anim_op.setEndValue(1.0)
+
+        anim_pos.start(QPropertyAnimation.DeleteWhenStopped)
+        anim_op.start(QPropertyAnimation.DeleteWhenStopped)
+
+        # 退出动画：延迟后位置微上滑 + 淡出并销毁
+        def _fade_out():
+            if not toast:
+                return
+            try:
+                if not toast.isVisible():
+                    return
+                out_pos = QPropertyAnimation(toast, b"pos", self)
+                out_pos.setDuration(240)
+                out_pos.setStartValue(toast.pos())
+                out_pos.setEndValue(QPoint(x, target_y - 10))
+                out_pos.setEasingCurve(QEasingCurve.InCubic)
+
+                out_op = QPropertyAnimation(opacity_effect, b"opacity", self)
+                out_op.setDuration(240)
+                out_op.setStartValue(1.0)
+                out_op.setEndValue(0.0)
+                out_op.finished.connect(toast.deleteLater)
+
+                out_pos.start(QPropertyAnimation.DeleteWhenStopped)
+                out_op.start(QPropertyAnimation.DeleteWhenStopped)
+            except Exception:
+                pass
+
+        QtCore.QTimer.singleShot(duration, _fade_out)
 
     def set_status(self, msg, level="info"):
         """统一状态栏消息，按级别着色。
@@ -2553,7 +3400,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 vw = tbl.cellWidget(r, 4)
                 if vw and isinstance(vw, QtWidgets.QComboBox):
                     vision_model = vw.currentData() or ""
-            self._add_model_row(mid, mid, reasoning, input_types, max_think, ctx, 16384, vision_model)
+            self._add_model_row(
+                mid, mid, reasoning, input_types, max_think, ctx, 16384,
+                vision_model, "auto",
+            )
             existing_ids.add(mid)
             imported += 1
         if imported:
@@ -2574,7 +3424,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
                 mname = m.get("name", mid)
                 label = f"{pname} / {mname} ({mid})"
-                vstr = f"{pname}:{mid}"
+                vstr = f"{pname}/{mid}"
                 if vstr not in seen:
                     seen.add(vstr)
                     candidates.append((label, vstr))
@@ -2744,6 +3594,16 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("pi-api-switcher")
 
+    # 单实例保护：防止两个实例并发写 models.json/auth.json/settings.json 互相覆盖
+    AGENT_DIR.mkdir(parents=True, exist_ok=True)
+    lock = QLockFile(str(AGENT_DIR / "api-switcher.lock"))
+    lock.setStaleLockTime(0)  # 永不认为锁过期，进程退出自动释放
+    if not lock.tryLock():
+        QtWidgets.QMessageBox.warning(
+            None, "pi-api-switcher", "程序已在运行（请检查系统托盘）。"
+        )
+        sys.exit(0)
+
     # 图标
     icon_path = Path(__file__).parent / "icon.ico"
     if not icon_path.exists():
@@ -2751,11 +3611,15 @@ def main():
     icon = QtGui.QIcon(str(icon_path)) if icon_path.exists() else QtGui.QIcon()
     app.setWindowIcon(icon)
 
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     bridge_status = install_vision_bridge()
+    guard_status = install_cache_guard(AGENT_DIR, bundle_root)
+    env_status = disable_optimizer_cache_key_fallback()
     store = ConfigStore()
     window = MainWindow(store)
-    level = "ok" if "已" in bridge_status else "info"
-    window.set_status(bridge_status, level)
+    statuses = [bridge_status, guard_status, env_status]
+    level = "ok" if all("失败" not in text and "未找到" not in text for text in statuses) else "warn"
+    window.set_status(" · ".join(statuses), level)
 
     # 系统托盘
     tray = TrayApp(icon, window, store)
