@@ -1028,6 +1028,10 @@ def generate_icon_ico(path: Path):
 # 后台工作线程（统一使用 QThread + pyqtSignal）
 # =============================================================================
 
+# 批量测速时同时进行的网络请求上限：避免供应商很多时打爆本地临时端口或触发上游限流
+MAX_CONCURRENT_PROBES = 8
+
+
 class TestEndpointWorker(QThread):
     """异步测试端点连通性，与 DataLoadWorker 风格一致。"""
     result_ready = pyqtSignal(str, bool, int, str, str)  # name, ok, latency, msg, payload
@@ -1059,6 +1063,39 @@ class ProbeModelsWorker(QThread):
         for row, mid in self.selected:
             ok, supports, msg = probe_model_capability(self.base_url, self.api_key, mid)
             self.result_ready.emit(row, mid, ok, supports, msg)
+
+
+class BatchEndpointTester(QThread):
+    """并发测试全部端点，内部用线程池把同时进行的请求数限制在 MAX_CONCURRENT_PROBES。
+    每得到一个结果立即发信号，UI 可增量更新（不再受线程数 = 供应商数限制）。"""
+    result_ready = pyqtSignal(str, bool, int, str, str)  # name, ok, latency, msg, payload
+
+    def __init__(self, targets, parent=None):
+        super().__init__(parent)
+        self.targets = targets  # [(name, base_url, api_key), ...]
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(MAX_CONCURRENT_PROBES, len(self.targets))) as pool:
+            futures = {
+                pool.submit(test_endpoint, base_url, key): (name, base_url)
+                for name, base_url, key in self.targets
+                if not self._stop
+            }
+            for fut in list(futures):
+                if self._stop:
+                    break
+                name, _url = futures[fut]
+                try:
+                    ok, latency, msg, model_infos = fut.result()
+                except Exception as e:  # 线程池内未捕获异常也当作单个失败，不影响其他端点
+                    ok, latency, msg, model_infos = False, 0, f"错误: {e}", []
+                payload = json.dumps(model_infos, ensure_ascii=False)
+                self.result_ready.emit(name, ok, int(latency), msg, payload)
 
 
 # =============================================================================
@@ -1269,7 +1306,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 测速结果缓存 {provider_name: {"ok": bool, "latency": int}}
         self._provider_test_results = {}
-        self._batch_test_workers = []
+        self._batch_tester = None  # 当前批量测速线程（BatchEndpointTester）
 
         self._build_menu()  # 菜单栏（必须在 _build_ui 前）
         self._build_ui()
@@ -2395,29 +2432,43 @@ class MainWindow(QtWidgets.QMainWindow):
             self.list_widget.setCurrentRow(0)
 
     def on_test_all_providers(self):
-        """并发测速所有 Provider 端点并更新侧边栏呼吸灯与延迟。"""
+        """并发测速所有 Provider 端点并更新侧边栏呼吸灯与延迟。
+
+        使用 BatchEndpointTester（线程池，最多 MAX_CONCURRENT_PROBES 路并发），
+        避免 N 个端点同时开 N 个线程打爆本地端口或触发上游限流。
+        """
         names = self.store.provider_names()
         if not names:
             self.set_status("无可用供应商", "warn")
             return
+
+        # 上一批还在跑则先取消，快速连点不会叠加请求
+        old_tester = getattr(self, "_batch_tester", None)
+        if old_tester is not None and old_tester.isRunning():
+            old_tester.stop()
+            old_tester.wait(1500)
+
         self.btn_test_all.setEnabled(False)
         self.set_status(f"正在并发测速 {len(names)} 个供应商端点...", "info")
         self.show_toast(f"⚡ 开始测试 {len(names)} 个端点...")
 
         self._pending_batch_count = len(names)
-        self._batch_test_workers.clear()
-
+        targets = []
         for name in names:
             p = self.store.get_provider(name)
             base_url = p.get("baseUrl", "").strip()
             key = self.store.api_key(name)
             if not base_url:
+                # 空 URL 直接在主线程标记失败，不进线程池
                 self._on_single_provider_tested(name, False, 0, "Base URL 为空", "[]")
                 continue
-            worker = TestEndpointWorker(base_url, key, name=name, parent=self)
-            worker.result_ready.connect(self._on_single_provider_tested)
-            self._batch_test_workers.append(worker)
-            worker.start()
+            targets.append((name, base_url, key))
+
+        if not targets:
+            return  # 全部为空 URL 时上面已把计数归零并重新启用按钮
+        self._batch_tester = BatchEndpointTester(targets, parent=self)
+        self._batch_tester.result_ready.connect(self._on_single_provider_tested)
+        self._batch_tester.start()
 
     @QtCore.pyqtSlot(str, bool, int, str, str)
     def _on_single_provider_tested(self, name, ok, latency, msg, payload):
