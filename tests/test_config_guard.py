@@ -8,19 +8,19 @@ import json
 
 import pytest
 
-import app
+import config_store
 
 
 @pytest.fixture
 def isolated_config(tmp_path, monkeypatch):
-    """把 app 的配置路径指到临时目录，隔离真实 ~/.pi/agent。"""
-    monkeypatch.setattr(app, "AGENT_DIR", tmp_path)
-    monkeypatch.setattr(app, "MODELS_PATH", tmp_path / "models.json")
-    monkeypatch.setattr(app, "AUTH_PATH", tmp_path / "auth.json")
-    monkeypatch.setattr(app, "SETTINGS_PATH", tmp_path / "settings.json")
-    monkeypatch.setattr(app, "CACHE_GUARD_CONFIG_PATH", tmp_path / "cache-compat-guard.json")
-    monkeypatch.setattr(app, "VISION_CONFIG_PATH", tmp_path / "vision-bridge.json")
-    monkeypatch.setattr(app, "SNAPSHOTS_DIR", tmp_path / "backups")
+    """把配置路径指到临时目录，隔离真实 ~/.pi/agent。"""
+    monkeypatch.setattr(config_store, "AGENT_DIR", tmp_path)
+    monkeypatch.setattr(config_store, "MODELS_PATH", tmp_path / "models.json")
+    monkeypatch.setattr(config_store, "AUTH_PATH", tmp_path / "auth.json")
+    monkeypatch.setattr(config_store, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(config_store, "CACHE_GUARD_CONFIG_PATH", tmp_path / "cache-compat-guard.json")
+    monkeypatch.setattr(config_store, "VISION_CONFIG_PATH", tmp_path / "vision-bridge.json")
+    monkeypatch.setattr(config_store, "SNAPSHOTS_DIR", tmp_path / "backups")
     yield tmp_path
 
 
@@ -31,15 +31,15 @@ def _write(path, text):
 def test_read_json_tracks_corruption(tmp_path):
     p = tmp_path / "broken.json"
     _write(p, "{not valid json")
-    assert app.read_json(p) == {}
-    assert p in app._CORRUPT_JSON_FILES
+    assert config_store.read_json(p) == {}
+    assert p in config_store._CORRUPT_JSON_FILES
 
 
 def test_save_blocked_when_models_json_corrupt(isolated_config):
     # 磁盘上的 models.json 损坏；内存中是解析失败后的空数据
     models_p = isolated_config / "models.json"
     _write(models_p, '{"providers": {"a": {"baseUrl": "https://x"}}')  # 缺右括号
-    store = app.ConfigStore()
+    store = config_store.ConfigStore()
     assert store.providers() == {}  # 解析失败 → 空
 
     store.add_provider("new", "https://example.com", "sk-test", "m1", "M1", False)
@@ -52,7 +52,7 @@ def test_save_blocked_when_models_json_corrupt(isolated_config):
 def test_save_allowed_after_external_repair(isolated_config):
     models_p = isolated_config / "models.json"
     _write(models_p, "corrupted")
-    store = app.ConfigStore()
+    store = config_store.ConfigStore()
     assert not store.save()
 
     # 用户在磁盘上修复了文件（例如从快照恢复）
@@ -66,6 +66,6 @@ def test_save_allowed_after_external_repair(isolated_config):
 def test_corrupt_critical_files_lists_only_broken(isolated_config):
     _write(isolated_config / "settings.json", "???")
     (isolated_config / "auth.json").write_text("{}", encoding="utf-8")
-    store = app.ConfigStore()
+    store = config_store.ConfigStore()
     broken = [p.name for p, _ in store.corrupt_critical_files()]
     assert broken == ["settings.json"]
