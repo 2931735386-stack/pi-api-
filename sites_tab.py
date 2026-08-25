@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """站点管理页：统一管理部署 API 的中转/自建站点（baseUrl + apiKey）。"""
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtWidgets
 
 
 class SiteDialog(QtWidgets.QDialog):

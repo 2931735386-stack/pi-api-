@@ -10,10 +10,10 @@ Custom PyQt5 Modern UI Widgets for pi-api-switcher:
 - ModelUsageListWidget: Left-bottom model breakdown cards with multi-color bars
 """
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtWidgets
 from PyQt5.QtCore import Qt, QRectF, QPointF
 from PyQt5.QtGui import (
-    QPainter, QColor, QPainterPath, QPen, QBrush, QLinearGradient, QFont
+    QPainter, QColor, QPainterPath, QPen, QBrush, QLinearGradient
 )
 
 

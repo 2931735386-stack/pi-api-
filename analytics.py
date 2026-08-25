@@ -13,8 +13,6 @@ Parses ~/.pi/agent/sessions/*.jsonl files to provide comprehensive statistics:
 """
 
 import json
-import os
-import time
 import datetime
 from pathlib import Path
 from collections import defaultdict

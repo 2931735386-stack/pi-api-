@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint (ruff, pyflakes rules)
+        run: ruff check --select=F *.py tests/
+
+      - name: Run tests
+        run: pytest tests/ -q
+
+  extension-tests:
+    # .mjs 运行时测试依赖全局安装的 @earendil-works/pi-coding-agent
+    # （使用其内置 jiti 加载 TypeScript 源码），且读取 APPDATA 路径，
+    # 因此必须在 windows-latest 上从仓库根目录运行。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pi coding agent (provides jiti + dist)
+        run: npm i -g @earendil-works/pi-coding-agent
+
+      - name: Run extension runtime tests
+        shell: bash
+        run: |
+          for f in tests/test_*.mjs; do
+            echo "== $f =="
+            node "$f"
+          done

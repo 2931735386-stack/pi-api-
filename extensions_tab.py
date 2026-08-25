@@ -4,10 +4,9 @@
 import os
 import re
 import shutil
-import sys
 from pathlib import Path
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtWidgets
 
 AGENT_DIR = Path.home() / ".pi" / "agent"
 SKILLS_DIR = AGENT_DIR / "skills"

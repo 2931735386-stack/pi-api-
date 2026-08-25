@@ -164,11 +164,19 @@ Switcher 会把 managed Guard 放在 `settings.json` 的 packages 列表末尾�
 ## 开发
 
 ```bash
-# 安装开发依赖
-pip install -r requirements.txt
+# 安装开发依赖（含测试/打包工具）
+pip install -r requirements-dev.txt
 
 # 运行
 python app.py
+
+# 运行测试
+pytest tests/ -q
+node tests/test_cache_guard.mjs   # 扩展运行时测试需从仓库根目录运行
+node tests/test_vision_bridge.mjs
+
+# 代码检查
+ruff check --select=F *.py tests/
 
 # 打包
 build.bat

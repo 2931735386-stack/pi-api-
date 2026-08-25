@@ -35,7 +35,7 @@
 ```bash
 git clone https://github.com/2931735386-stack/pi-api-.git
 cd pi-api-
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 python app.py
 ```
 
@@ -43,5 +43,6 @@ python app.py
 
 - Python 代码遵循 [PEP 8](https://peps.python.org/pep-0008/)，缩进 4 空格。
 - 文件统一 UTF-8 编码、LF 换行（见 `.editorconfig`）。
-- 新增功能尽量保持单文件 `app.py` 的结构，避免过度拆分。
+- 提交前请跑 `ruff check --select=F *.py tests/` 与 `pytest tests/ -q`。
+- 新增功能优先拆分为独立模块；`app.py` 只保留主窗口与装配逻辑，避免继续膨胀。
 - 不要提交敏感信息（如真实 apiKey）。

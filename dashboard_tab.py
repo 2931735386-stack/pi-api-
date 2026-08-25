@@ -9,7 +9,7 @@ Modern Analytics Dashboard Tab for pi-api-switcher
 - Bottom Right: Token 活动 (Heatmap + Input/Output summary) & 请求健康时间线 (Heatmap + Success/Fail stats)
 """
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QFileSystemWatcher
 from pathlib import Path
 
