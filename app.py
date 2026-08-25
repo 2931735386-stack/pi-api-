@@ -340,12 +340,19 @@ def validate_baseurl(url: str) -> bool:
     return re.match(r"^https?://", url.strip()) is not None
 
 
+# 启动以来解析失败的 JSON 文件 {Path: 错误信息}，供 UI 提示与保存防护使用
+_CORRUPT_JSON_FILES = {}
+
+
 def read_json(path: Path):
     if not path.exists():
         return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError) as exc:
+        # 损坏时返回 {} 并记录，ConfigStore 会据此阻止覆盖式保存，
+        # 避免用空数据把用户仅存的配置抹掉
+        _CORRUPT_JSON_FILES[path] = str(exc)
         return {}
 
 
@@ -395,7 +402,23 @@ class ConfigStore:
     """封装对三个 JSON 文件的读写。"""
 
     def __init__(self):
+        self.last_save_error = ""
         self.load()
+
+    def corrupt_critical_files(self):
+        """实时探测三个主配置文件，返回无法解析的 [(path, err)]。
+
+        每次保存前重新读盘检查：用户在外部修复后无需重启即可解除拦截。
+        """
+        out = []
+        for path in (MODELS_PATH, AUTH_PATH, SETTINGS_PATH):
+            if not path.exists():
+                continue
+            try:
+                json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                out.append((path, str(exc)))
+        return out
 
     def load(self):
         self.models = read_json(MODELS_PATH)
@@ -467,6 +490,13 @@ class ConfigStore:
         return self.settings.get("defaultModel", "")
 
     def save(self) -> bool:
+        # 防覆盖保护：主配置文件在磁盘上无法解析时拒绝写入，
+        # 避免内存中的不完整数据把用户仅存的配置抹掉（快照里通常还有好备份）
+        corrupt = self.corrupt_critical_files()
+        if corrupt:
+            self.last_save_error = "；".join(f"{p.name}：{err}" for p, err in corrupt)
+            return False
+        self.last_save_error = ""
         snapshot_configs()
         ok1 = write_json(MODELS_PATH, self.models)
         ok2 = write_json(AUTH_PATH, self.auth)
@@ -2287,17 +2317,46 @@ class MainWindow(QtWidgets.QMainWindow):
         """左侧列表即时搜索过滤。"""
         self.refresh_list(keep_selection=True)
 
+    def _provider_item_text(self, name, p=None):
+        """构造侧边栏单个 provider 条目的显示文本（列表构建与测速徽章更新共用）。"""
+        if p is None:
+            p = self.store.get_provider(name)
+        m_count = len(p.get("models", []))
+        marker = "★ " if name == self.store.default_provider() else "   "
+        icon = self._provider_icon(name)
+        # 测速指示状态
+        test_res = self._provider_test_results.get(name)
+        latency_badge = ""
+        if test_res:
+            if test_res.get("ok"):
+                lat = test_res.get("latency", 0)
+                dot = "🟢" if lat < 600 else "🟡"
+                latency_badge = f" {dot}{lat}ms"
+            else:
+                latency_badge = " 🔴超时"
+        return f"{icon} {marker}{name} ({m_count}模型){latency_badge}"
+
+    def _update_provider_test_badge(self, name):
+        """只更新指定 provider 的列表条目文本。
+
+        替代原先每个测速结果都全量重建 QListWidget 的做法（O(N²) 且闪烁、丢滚动位置）。
+        若该条目被搜索过滤隐藏或列表尚未构建，跳过即可——下次 refresh_list 会带上新徽章。
+        """
+        for i in range(self.list_widget.count()):
+            it = self.list_widget.item(i)
+            if it.data(QtCore.Qt.UserRole) == name:
+                it.setText(self._provider_item_text(name))
+                break
+
     def refresh_list(self, select_name=None, keep_selection=False):
         current_sel = self.current_name() if keep_selection else select_name
         self.list_widget.clear()
         names = self.store.provider_names()
-        default = self.store.default_provider()
         search_kw = getattr(self, "ed_search", None).text().strip().lower() if hasattr(self, "ed_search") else ""
 
         for name in names:
             p = self.store.get_provider(name)
             models = p.get("models", [])
-            m_count = len(models)
 
             # 搜索过滤匹配（provider 名、base_url、或模型 id/name）
             if search_kw:
@@ -2306,20 +2365,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not (match_p or match_m):
                     continue
 
-            marker = "★ " if name == default else "   "
-            icon = self._provider_icon(name)
-            # 测速指示状态
-            test_res = self._provider_test_results.get(name)
-            latency_badge = ""
-            if test_res:
-                if test_res.get("ok"):
-                    lat = test_res.get("latency", 0)
-                    dot = "🟢" if lat < 600 else "🟡"
-                    latency_badge = f" {dot}{lat}ms"
-                else:
-                    latency_badge = " 🔴超时"
-
-            item = QtWidgets.QListWidgetItem(f"{icon} {marker}{name} ({m_count}模型){latency_badge}")
+            item = QtWidgets.QListWidgetItem(self._provider_item_text(name, p))
             item.setData(QtCore.Qt.UserRole, name)
             self.list_widget.addItem(item)
 
@@ -2376,7 +2422,8 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(str, bool, int, str, str)
     def _on_single_provider_tested(self, name, ok, latency, msg, payload):
         self._provider_test_results[name] = {"ok": ok, "latency": latency, "msg": msg}
-        self.refresh_list(keep_selection=True)
+        # 只更新对应条目，避免 N 个结果触发 N 次全量列表重建
+        self._update_provider_test_badge(name)
         if hasattr(self, "_pending_batch_count"):
             self._pending_batch_count -= 1
             if self._pending_batch_count <= 0:
@@ -2935,7 +2982,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "已存在", f"供应商 '{name}' 已存在")
             return
         self.store.add_provider(name, "", "", "", name, False)
-        self.store.save()
+        self._save_store()
         self.refresh_list(select_name=name)
         self._refresh_tray()
 
@@ -2985,7 +3032,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "修改失败", str(exc))
             return
-        if not self.store.save():
+        if not self._save_store():
             self.store.models = snapshot["models"]
             self.store.auth = snapshot["auth"]
             self.store.settings = snapshot["settings"]
@@ -2994,7 +3041,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.store.save()
             self.refresh_list(select_name=old_name)
             QtWidgets.QMessageBox.critical(
-                self, "保存失败", "修改供应商名称失败，已恢复原名称，请检查文件写入权限。"
+                self, "保存失败",
+                "修改供应商名称失败，已恢复原名称。\n"
+                f"原因：{self.store.last_save_error or '请检查文件写入权限'}"
             )
             return
         self._provider_test_results.pop(old_name, None)
@@ -3019,7 +3068,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "已取消", "输入不匹配，未删除。")
             return
         self.store.remove_provider(name)
-        self.store.save()
+        if not self._save_store():
+            return
         self.refresh_list()
         self._refresh_tray()
         self.set_status(f"已删除 {name}", "ok")
@@ -3027,6 +3077,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_tray(self):
         if self.tray is not None:
             self.tray._build_menu()
+
+    def _save_store(self) -> bool:
+        """统一保存入口：主配置文件损坏时弹窗拦截并引导恢复，其余失败由调用方提示。"""
+        if self.store.save():
+            return True
+        corrupt = self.store.corrupt_critical_files()
+        if corrupt and self.isVisible():
+            names = "\n".join(f"• {p.name}：{err}" for p, err in corrupt)
+            QtWidgets.QMessageBox.warning(
+                self, "配置文件损坏",
+                "以下配置文件无法解析，为防止数据被覆盖丢失，本次修改未写入磁盘：\n\n"
+                f"{names}\n\n"
+                "可从「快照备份」恢复历史版本，或手动修复文件后重试。",
+            )
+        return False
 
     def on_save(self):
         name = self.current_name()
@@ -3067,7 +3132,7 @@ class MainWindow(QtWidgets.QMainWindow):
         key = self.ed_apikey.text().strip()
         self.store.set_api_key(name, key)
 
-        if self.store.save():
+        if self._save_store():
             self.set_status(
                 f"已保存 {name}（{len(models)} 个模型）· 缓存策略 {effective_policy} · "
                 "重启 pi 或执行 /reload 生效",
@@ -3097,9 +3162,12 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "提示", "请先在模型列表填写模型 ID")
             return
         self.store.set_default(name, model_id)
-        self.store.save()
-        self.set_status(f"已将 {name}/{model_id} 设为默认（pi 下次启动生效）", "ok")
-        self.show_toast(f"⭐ 已设为默认模型：{name} / {model_id}")
+        if self._save_store():
+            self.set_status(f"已将 {name}/{model_id} 设为默认（pi 下次启动生效）", "ok")
+            self.show_toast(f"⭐ 已设为默认模型：{name} / {model_id}")
+        else:
+            self.set_status("设置默认模型失败：" + (self.store.last_save_error or "文件写入失败"), "err")
+            return
         self.refresh_list(select_name=name)
         self._refresh_tray()
 
@@ -3567,8 +3635,10 @@ class TrayApp(QtWidgets.QSystemTrayIcon):
     def _set_default(self, name, model_id):
         if model_id:
             self.store.set_default(name, model_id)
-            self.store.save()
-            self.showMessage("pi API Switcher", f"已切换默认: {name}/{model_id}")
+            if self.window._save_store():
+                self.showMessage("pi API Switcher", f"已切换默认: {name}/{model_id}")
+            else:
+                self.showMessage("pi API Switcher", "切换失败：配置文件异常，请在主窗口查看详情")
             self.window.refresh_list(select_name=name)
             self._build_menu()
 
